@@ -21,6 +21,10 @@ pub struct PostCandidate {
     pub last_scored_at_ms: Option<u64>,
     pub weighted_score: Option<f64>,
     pub score: Option<f64>,
+    /// Causal liveness prior. Absent or wide means ranking is unchanged.
+    /// Never a user-visible score. See docs/pulse.md.
+    #[serde(default)]
+    pub pulse: Option<super::pulse::PulseEvidence>,
     pub slate_context: Option<SlateContext>,
     #[serde(default)]
     pub served_slate_context: Option<SlateContext>,
@@ -307,7 +311,7 @@ mod tests {
     fn safety_label_info_deserializes_from_i32() {
         use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
-        let json = r#"{"label_type":1,"description":null,"source":null}"#;
+        let json = r#"{\"label_type\":1,\"description\":null,\"source\":null}"#;
         let info: SafetyLabelInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.label_type, SafetyLabelType::SPAM);
     }
