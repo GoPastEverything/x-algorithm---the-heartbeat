@@ -311,7 +311,7 @@ mod tests {
     fn safety_label_info_deserializes_from_i32() {
         use xai_x_thrift::tweet_safety_label::SafetyLabelType;
 
-        let json = r#"{\"label_type\":1,\"description\":null,\"source\":null}"#;
+        let json = r#"{"label_type":1,"description":null,"source":null}"#;
         let info: SafetyLabelInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.label_type, SafetyLabelType::SPAM);
     }

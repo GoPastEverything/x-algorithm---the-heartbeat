@@ -1,4 +1,5 @@
 use crate::models::candidate::{PhoenixScores, PostCandidate, SlateContext};
+use crate::models::pulse;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::author_cold_start::AuthorColdStart;
@@ -613,6 +614,15 @@ impl RankingScorer {
             .collect()
     }
 
+
+    fn apply_pulse(query: &ScoredPostsQuery, candidate: &PostCandidate, score: f64) -> f64 {
+        score
+            * pulse::causal_multiplier(
+                query.params.get(EnablePulsePrior),
+                candidate.pulse.as_ref(),
+            )
+    }
+
     fn effective_oon_weight(query: &ScoredPostsQuery) -> f64 {
         if !query.topic_ids.is_empty() {
             return query.params.get(TopicOonWeightFactor);
@@ -720,6 +730,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
                 .zip(final_scores)
                 .enumerate()
                 .map(|(i, (&weighted, score))| {
+                    let score = Self::apply_pulse(query, &candidates[i], score);
                     Ok(PostCandidate {
                         weighted_score: Some(weighted),
                         score: Some(score),
@@ -758,6 +769,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for RankingScorer {
             .zip(final_scores)
             .enumerate()
             .map(|(i, (&weighted, score))| {
+                let score = Self::apply_pulse(query, &candidates[i], score);
                 Ok(PostCandidate {
                     weighted_score: Some(weighted),
                     score: Some(score),
@@ -1567,5 +1579,85 @@ mod tests {
             weighted < 1.0,
             "weighted-mode score should be small: {weighted}"
         );
+    }
+
+    #[tokio::test]
+    async fn pulse_prior_is_a_noop_until_evidence_is_confident() {
+        let scorer = test_scorer();
+        let flags_off = [("rust_home_mixer_enable_author_diversity", "false")];
+        let with_favorite = |pulse: Option<pulse::PulseEvidence>| PostCandidate {
+            phoenix_scores: PhoenixScores {
+                favorite_score: Some(0.5),
+                ..Default::default()
+            },
+            pulse,
+            ..candidate(7, Some(true))
+        };
+        let base_candidate = with_favorite(None);
+        let base = scorer
+            .score(&query_with_flags(&flags_off), std::slice::from_ref(&base_candidate))
+            .await;
+        let base_score = base[0].as_ref().unwrap().score.unwrap();
+        let base_weighted = base[0].as_ref().unwrap().weighted_score.unwrap();
+
+        let wide = with_favorite(Some(pulse::PulseEvidence {
+            liveness: 0.2,
+            sigma: 0.26,
+            independence: 0.1,
+            ci: 0.9,
+            lagged_n: 40,
+            lagged_swarm_share: 0.95,
+            lagged_diversity: 0.1,
+            lagged_sync: 0.95,
+        }));
+        let wide_scored = scorer
+            .score(
+                &query_with_flags(&[
+                    ("rust_home_mixer_enable_author_diversity", "false"),
+                    ("rust_home_mixer_enable_pulse_prior", "true"),
+                ]),
+                std::slice::from_ref(&wide),
+            )
+            .await;
+        let wide_score = wide_scored[0].as_ref().unwrap().score.unwrap();
+        assert!(
+            (wide_score - base_score).abs() < 1e-9,
+            "wide posterior must not move the score: {wide_score} vs {base_score}"
+        );
+
+        let swarm = with_favorite(Some(pulse::PulseEvidence {
+            liveness: 0.18,
+            sigma: 0.05,
+            independence: 0.12,
+            ci: 0.82,
+            lagged_n: 24,
+            lagged_swarm_share: 0.9,
+            lagged_diversity: 0.15,
+            lagged_sync: 0.88,
+        }));
+        let swarm_scored = scorer
+            .score(
+                &query_with_flags(&[
+                    ("rust_home_mixer_enable_author_diversity", "false"),
+                    ("rust_home_mixer_enable_pulse_prior", "true"),
+                ]),
+                std::slice::from_ref(&swarm),
+            )
+            .await;
+        let swarm_score = swarm_scored[0].as_ref().unwrap().score.unwrap();
+        let swarm_weighted = swarm_scored[0].as_ref().unwrap().weighted_score.unwrap();
+        assert!(
+            swarm_score < base_score * 0.9,
+            "confident coordinated evidence should discount: {swarm_score} vs {base_score}"
+        );
+        assert!(
+            (swarm_weighted - base_weighted).abs() < 1e-9,
+            "q_t must not rewrite the Phoenix weighted sum"
+        );
+
+        let off = scorer
+            .score(&query_with_flags(&flags_off), std::slice::from_ref(&swarm))
+            .await;
+        assert!((off[0].as_ref().unwrap().score.unwrap() - base_score).abs() < 1e-9);
     }
 }
