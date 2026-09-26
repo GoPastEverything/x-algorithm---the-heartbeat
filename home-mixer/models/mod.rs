@@ -1,5 +1,6 @@
 pub mod brand_safety;
 pub mod candidate;
+pub mod pulse;
 pub mod candidate_features;
 pub mod engagement_signals;
 
