@@ -22,6 +22,7 @@ from grox.flows.ptos.mode import SafetyPtosMode
 from grok_sampler.config import GrokModelConfig, EapiModelConfig
 from grox.flows.ptos.prompts import (
     adult_content_policy_prompt,
+    age_gating_harmful_text_policy_prompt,
     child_safety_policy_prompt,
     hate_or_abuse_policy_prompt,
     illegal_and_regulated_behaviors_policy_prompt,
@@ -102,7 +103,7 @@ _eapi_4_6_internal_breaker = CircuitBreaker(
 
 
 class SafetyPtosCategoryClassifier:
-    result_pattern = re.compile(r"(.*)<json>(.*)</json>", re.DOTALL)
+    result_pattern = re.compile(r"(.*)<json(?!\w)[>}\]]?(.*)</json>", re.DOTALL)
 
     def __init__(
         self,
@@ -200,6 +201,8 @@ class SafetyPtosPolicyCrossValidator:
     def __init__(self):
         eapi_4_5 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_5_X_ALGO)
         self.eapi_4_5_x_algo = EapiSampler(EapiModelConfig(**eapi_4_5.model_dump()))
+        eapi_4_1 = grox_config.get_eapi_model(ModelName.EAPI_GROK_4_1_FAST_X_ALGO)
+        self.eapi_4_1_x_algo = EapiSampler(EapiModelConfig(**eapi_4_1.model_dump()))
 
     def _parse_policy(self, raw: str) -> SafetyPolicy | None:
         match = self.result_pattern.search(raw)
@@ -351,17 +354,16 @@ class SafetyPtosPolicyCrossValidator:
     async def _validate_illegal_and_regulated_behaviors(
         self, post: Post, policy: SafetyPolicy
     ) -> SafetyPolicy:
-        metric = "safety_ptos.illegal_and_regulated_behaviors_cross_model_validate_with_grok_4_5"
+        metric = "safety_ptos.illegal_and_regulated_behaviors_cross_model_validate_with_grok_4_1"
         convo = self._build_policy_convo(
             post,
             SafetyPolicyCategory.IllegalAndRegulatedBehaviors,
             illegal_and_regulated_behaviors_policy_prompt(),
         )
         try:
-            async with _eapi_4_5_x_algo_breaker.guard():
-                raw = await self.eapi_4_5_x_algo.sample(
-                    convo.interleaveToEapi(), conversation_id=convo.conversation_id
-                )
+            raw = await self.eapi_4_1_x_algo.sample(
+                convo.interleaveToEapi(), conversation_id=convo.conversation_id
+            )
             confirm = self._parse_policy(raw)
             if confirm is None:
                 logger.error(
@@ -370,7 +372,7 @@ class SafetyPtosPolicyCrossValidator:
                 )
                 Metrics.counter(metric).add(1, attributes={"outcome": "unparseable"})
                 return _policy_no_violation(
-                    "illegal_and_regulated_behaviors_grok_4_5_parse_error"
+                    "illegal_and_regulated_behaviors_grok_4_1_parse_error"
                 )
             if confirm.policyType == policy.policyType:
                 logger.info(
@@ -389,7 +391,7 @@ class SafetyPtosPolicyCrossValidator:
             Metrics.counter(metric).add(1, attributes={"outcome": "disagreed"})
             return _policy_no_violation(
                 confirm.reason
-                or f"illegal_and_regulated_behaviors_grok_4_5_disagreed: cv={confirm.policyType.value}"
+                or f"illegal_and_regulated_behaviors_grok_4_1_disagreed: cv={confirm.policyType.value}"
             )
         except Exception:
             logger.error(
@@ -398,7 +400,7 @@ class SafetyPtosPolicyCrossValidator:
             )
             Metrics.counter(metric).add(1, attributes={"outcome": "error"})
             return _policy_no_violation(
-                "illegal_and_regulated_behaviors_grok_4_5_sample_error"
+                "illegal_and_regulated_behaviors_grok_4_1_sample_error"
             )
 
 
@@ -487,7 +489,6 @@ class SafetyPtosPolicyClassifier:
 
         oai_config = grox_config.get_oai_model(gemma_model_name)
         self.oai_gemma4 = OaiSampler(oai_config)
-        self.use_oai_gemma4_dial = 1.0
 
         if self.deluxe:
             eapi_config_4_3_x_algo = grox_config.get_eapi_model(
@@ -520,6 +521,8 @@ class SafetyPtosPolicyClassifier:
             return violent_speech_policy_prompt()
         elif violation.category == SafetyPolicyCategory.SuicideOrSelfHarm:
             return suicide_or_self_harm_policy_prompt()
+        elif violation.category == SafetyPolicyCategory.AgeGatingHarmfulText:
+            return age_gating_harmful_text_policy_prompt()
         else:
             raise ValueError(
                 f"No policy prompt available for category: {violation.category.value}"
@@ -572,6 +575,7 @@ class SafetyPtosPolicyClassifier:
         SafetyPolicyCategory.HateOrAbuse,
         SafetyPolicyCategory.ViolentSpeech,
         SafetyPolicyCategory.SuicideOrSelfHarm,
+        SafetyPolicyCategory.AgeGatingHarmfulText,
     }
 
     DELUXE_4_3_CATEGORIES = {
@@ -586,6 +590,8 @@ class SafetyPtosPolicyClassifier:
 
     USE_GEMMA_CATEGORIES = {
         SafetyPolicyCategory.Spam,
+        SafetyPolicyCategory.IllegalAndRegulatedBehaviors,
+        SafetyPolicyCategory.AgeGatingHarmfulText,
     }
 
     USE_THREAD_RENDERER_CATEGORIES = {
@@ -708,19 +714,14 @@ class SafetyPtosPolicyClassifier:
         )
 
     async def _sample(self, convo: Conversation, sample_for_gemma: bool = False) -> str:
-        if (
-            sample_for_gemma
-            and not self.deluxe
-            and self.use_gemma
-            and random.random() < self.use_oai_gemma4_dial
-        ):
+        if sample_for_gemma:
             try:
                 return await self.oai_gemma4.sample(
                     convo.to_openai_messages(), conversation_id=convo.conversation_id
                 )
             except Exception:
                 logger.error(
-                    f"OaiSampler (gemma4) failed for spam policy, falling back to grok: {traceback.format_exc()}"
+                    f"OaiSampler (gemma4) failed for policy, falling back to grok: {traceback.format_exc()}"
                 )
         return await self.llm.sample(
             convo.interleave(), conversation_id=convo.conversation_id

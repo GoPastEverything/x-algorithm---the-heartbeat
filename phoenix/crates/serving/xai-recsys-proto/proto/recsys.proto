@@ -15,6 +15,8 @@ service RecsysRetrievalPredictor {
   rpc RetrieveTopKCandidates(RetrieveTopKCandidatesRequest)
       returns (RetrieveTopKCandidatesResponse) {}
 
+  rpc ScorePosts(ScorePostsRequest) returns (ScorePostsResponse) {}
+
   rpc ReloadModel(ReloadModelRequest) returns (ReloadModelResponse) {}
 }
 
@@ -60,6 +62,21 @@ message UserContext {
   int32 user_following_count = 15;
   int32 user_blockers_count = 16;
   int32 user_muters_count = 17;
+  bool is_nsfw_user = 18;
+  bool is_nsfw_mode = 19;
+}
+
+message EngagementCountRow {
+  int32 action = 1;
+  repeated uint32 counts = 2;
+}
+
+message EngagementCounts {
+  bool present = 1;
+  repeated uint32 window_secs = 2;
+  repeated EngagementCountRow rows = 3;
+  int64 updated_at_ms = 4;
+  int64 window_end_ms = 5;
 }
 
 message ConversionHistoryContext {
@@ -114,6 +131,26 @@ message PredictNextActionsRequest {
   repeated ConvAssetIds conv_asset_ids = 18;
 
   PageDecodeParams pageDecode = 19;
+
+  bool returnBackboneScores = 20;
+
+  map<string, string> experiment_overrides = 21;
+
+  bool returnLogitsList = 22;
+
+  repeated PurchaseValueBaseline purchase_value_baselines = 23;
+  EngagementCounts user_ads_engagement_counts = 24;
+}
+
+message PurchaseValueBaseline {
+  int64 impression_id = 1;
+  int64 advertiser_account_id = 2;
+  double mean_value_usd_28d = 3;
+  double mean_value_usd_28d_vt = 4;
+  double mean_content_view_usd_28d = 5;
+  double mean_add_to_cart_usd_28d = 6;
+  double mean_content_view_usd_28d_vt = 7;
+  double mean_add_to_cart_usd_28d_vt = 8;
 }
 
 message PageDecodeParams {
@@ -186,10 +223,39 @@ message RetrieveTopKCandidatesRequest {
   repeated float search_query_embedding = 11;
 
   UserContext user_context = 12;
+
+  uint32 num_cold_start_to_retrieve = 13;
 }
 
 message RetrieveTopKCandidatesResponse {
   repeated ScoredCandidates topKCandidates = 1;
+}
+
+message ScorePostsRequest {
+  uint64 user_id = 1;
+  bytes columnar_sequence = 2;
+  ClientContext client_context = 3;
+  UserContext user_context = 4;
+  repeated uint64 post_ids = 5;
+
+  repeated uint32 requested_actions = 6;
+  repeated uint32 post_action_masks = 7;
+}
+
+message ScorePostsResponse {
+  PostActionScores scores = 1;
+}
+
+message PostActionScores {
+  repeated uint32 action_indices = 1;
+
+  uint32 num_posts = 2;
+
+  bytes probabilities_bf16 = 3;
+
+  bytes found = 4;
+
+  repeated uint32 post_action_masks = 5;
 }
 
 message DeviceFeature {
@@ -228,6 +294,24 @@ message ScoredCandidates {
   repeated ScoredCandidate candidates = 2;
 }
 
+enum RetrievalDatasetType {
+  RETRIEVAL_DATASET_TYPE_PAD = 0;
+  RETRIEVAL_DATASET_TYPE_HOME = 1;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_2_DAY = 2;
+  RETRIEVAL_DATASET_TYPE_RELEVANT_ADS = 3;
+  RETRIEVAL_DATASET_TYPE_CAROUSEL_ADS = 4;
+  RETRIEVAL_DATASET_TYPE_EVERGREEN = 5;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_NSFW = 6;
+  RETRIEVAL_DATASET_TYPE_ACTIVE_ADS = 7;
+  RETRIEVAL_DATASET_TYPE_IMMERSIVE_4_DAY = 8;
+  RETRIEVAL_DATASET_TYPE_IMAGINE = 9;
+  RETRIEVAL_DATASET_TYPE_TAIL = 10;
+  RETRIEVAL_DATASET_TYPE_DPA_PRODUCTS = 11;
+  RETRIEVAL_DATASET_TYPE_TRENDING = 12;
+  RETRIEVAL_DATASET_TYPE_HOME_COLD = 13;
+  RETRIEVAL_DATASET_TYPE_HOME_HOT = 14;
+}
+
 message ScoredCandidate {
   TweetInfo candidate = 1;
 
@@ -256,6 +340,11 @@ message NextActionDistribution {
   RewardOutputs rewardOutputs = 8;
 
   SlateContext slateContext = 9;
+
+  repeated float backboneTopLogProbs = 10;
+  repeated float backboneContinuousValues = 11;
+
+  repeated float requestedActionLogits = 12;
 }
 
 message RewardOutputs {
@@ -372,6 +461,9 @@ enum ActionName {
   CLIENT_TWEET_SEARCH_QUERY_REFORMULATED = 104;
   CLIENT_TWEET_RELEVANT_TO_SEARCH = 105;
   CLIENT_TWEET_NOT_RELEVANT_TO_SEARCH = 106;
+  CLIENT_TWEET_LIVE_STREAM_REPLY = 107;
+  RESERVED_108 = 108;
+  CLIENT_NOTIFICATION_SETTING_OPT_OUT = 110;
 
   ADS_WEB_CONVERSION = 128;
   ADS_VIDEO_VIEW = 129;
@@ -453,7 +545,27 @@ enum ActionName {
   ADS_SEARCH_CONVERSION_DELAYED = 211;
   ADS_SIGN_UP_CONVERSION_DELAYED = 212;
   ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED = 213;
-  reserved 214 to 252;
+  ADS_ATTRIBUTED_KEY_CLICK_CONVERSION_DELAYED_TIER_2 = 214;
+  ADS_ATTRIBUTED_CLICK_CONVERSION_DELAYED_TIER_2 = 215;
+  ADS_PURCHASE_CONVERSION_DELAYED_TIER_2 = 216;
+  ADS_MID_FUNNEL_CONVERSION_DELAYED_TIER_2 = 217;
+  ADS_ADD_TO_CART_CONVERSION_DELAYED_TIER_2 = 218;
+  ADS_UPPER_FUNNEL_CONVERSION_DELAYED_TIER_2 = 219;
+  ADS_WEB_CONVERSION_DELAYED_TIER_2 = 220;
+  ADS_SEARCH_CONVERSION_DELAYED_TIER_2 = 221;
+  ADS_SIGN_UP_CONVERSION_DELAYED_TIER_2 = 222;
+  ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED_TIER_2 = 223;
+  ADS_ATTRIBUTED_KEY_CLICK_CONVERSION_DELAYED_TIER_3 = 224;
+  ADS_ATTRIBUTED_CLICK_CONVERSION_DELAYED_TIER_3 = 225;
+  ADS_PURCHASE_CONVERSION_DELAYED_TIER_3 = 226;
+  ADS_MID_FUNNEL_CONVERSION_DELAYED_TIER_3 = 227;
+  ADS_ADD_TO_CART_CONVERSION_DELAYED_TIER_3 = 228;
+  ADS_UPPER_FUNNEL_CONVERSION_DELAYED_TIER_3 = 229;
+  ADS_WEB_CONVERSION_DELAYED_TIER_3 = 230;
+  ADS_SEARCH_CONVERSION_DELAYED_TIER_3 = 231;
+  ADS_SIGN_UP_CONVERSION_DELAYED_TIER_3 = 232;
+  ADS_CHECKOUT_INITIATED_CONVERSION_DELAYED_TIER_3 = 233;
+  reserved 234 to 252;
   P_OPEN_LINK_P90 = 253;
   ADS_MMP_CLICK = 254;
   PLACE_HOLDER_255 = 255;
@@ -465,6 +577,7 @@ enum ContinuousActionName {
   CLICK_DWELL_TIME = 2;
   ACTIVE_SECS_5M_RESIDUAL_NORM = 3;
   BRIDGE_PROBABILITY = 4;
+  ADS_WEB_CT_PURCHASE_VALUE = 5;
 }
 
 enum ActionGroup {
@@ -964,6 +1077,11 @@ enum ProductSurface {
   PRODUCT_SURFACE_COMMUNITIES_TIMELINE = 13;
   PRODUCT_SURFACE_EXPLORE_PAGE = 14;
   PRODUCT_SURFACE_HOME_TIMELINE_RANKED_FOLLOWING = 15;
+  PRODUCT_SURFACE_TREND_PAGE = 16;
+  PRODUCT_SURFACE_EXPLORE_SPOTLIGHT = 17;
+  PRODUCT_SURFACE_PLACE_HOLDER_18 = 18;
+  PRODUCT_SURFACE_PLACE_HOLDER_19 = 19;
+  PRODUCT_SURFACE_PLACE_HOLDER_20 = 20;
 }
 
 enum Page {
@@ -1210,6 +1328,24 @@ message TweetInfo {
   uint64 bookmarkCount = 34;
 
   ScoreInfo scoreInfo = 35;
+  ContentFeatures contentFeatures = 36;
+  ContentFeatures quotedContentFeatures = 37;
+  SearchLexicalMatch searchLexicalMatch = 38;
+}
+
+message SearchLexicalMatch {
+  float matchedWordFraction = 1;
+  bool exactPhrase = 2;
+}
+
+message ContentFeatures {
+  bool hasVideo = 1;
+  uint32 maxVideoDurationMs = 2;
+  bool hasPhoto = 3;
+  uint32 mediaCount = 4;
+  uint32 weightedTextLen = 5;
+  uint32 newlineCount = 6;
+  bool hasUrl = 7;
 }
 
 message ScoreInfo {
@@ -1238,6 +1374,8 @@ message SlateContext {
   optional uint32 reconCosMilli = 13;
   optional uint32 reconCountAbove = 14;
   optional uint32 reconGapAbove = 15;
+  optional uint32 exactK = 16;
+  optional uint32 exactGap = 17;
 }
 
 message ActionInfo {
@@ -1384,12 +1522,16 @@ message AdInfo {
 
   int64 fundingInstrumentId = 16;
 
+  UnifiedCardType unified_card_type = 18;
+
   int64 product_set_id = 19;
   int64 line_item_daily_budget_local_micro = 20;
 
   repeated int64 product_keys = 21;
 
   DpaProductInfo dpa_product_info = 22;
+
+  EngagementCounts engagement_counts = 23;
 }
 
 message UserAdActionMeta {
@@ -1609,7 +1751,7 @@ enum UserActionAggregationType {
   IMMERSIVE = 26;
   ADS_CHAD_WITH_CONV_TYPES = 27;
   ADS_WITH_KV_AD_HISTORY = 28;
-  PLACEHOLDER_29 = 29;
+  IMMERSIVE_LONG_DWELL = 29;
   PLACEHOLDER_30 = 30;
   PLACEHOLDER_31 = 31;
   PLACEHOLDER_32 = 32;
@@ -1691,6 +1833,38 @@ message UserMetadata {
   uint64 last_updated_ms = 3;
   uint64 first_sequence_time_ms = 4;
   uint64 last_sequence_time_ms = 5;
+}
+
+enum UnifiedCardType {
+  UNIFIED_CARD_TYPE_UNSPECIFIED = 0;
+  IMAGE_WEBSITE = 1;
+  VIDEO_WEBSITE = 2;
+  IMAGE_APP = 3;
+  VIDEO_APP = 4;
+  IMAGE_AND_URLS = 5;
+  VIDEO_AND_URLS = 6;
+  IMAGE_CAROUSEL_WEBSITE = 7;
+  IMAGE_CAROUSEL_APP = 8;
+  VIDEO_CAROUSEL_WEBSITE = 9;
+  VIDEO_CAROUSEL_APP = 10;
+  VIDEO_PLAYABLE_APP = 11;
+  IMAGE = 12;
+  VIDEO = 13;
+  IMAGE_AND_BUTTON_WEBSITE = 14;
+  VIDEO_AND_BUTTON_WEBSITE = 15;
+  PRODUCT = 16;
+  SUMMARY_LARGE_IMAGE = 17;
+  IMAGE_MULTI_DEST_CAROUSEL_APP = 18;
+  VIDEO_MULTI_DEST_CAROUSEL_APP = 19;
+  IMAGE_MULTI_DEST_CAROUSEL_WEBSITE = 20;
+  VIDEO_MULTI_DEST_CAROUSEL_WEBSITE = 21;
+  MIXED_MEDIA_SINGLE_DEST_CAROUSEL_APP = 22;
+  MIXED_MEDIA_SINGLE_DEST_CAROUSEL_WEBSITE = 23;
+  MIXED_MEDIA_MULTI_DEST_CAROUSEL_APP = 24;
+  MIXED_MEDIA_MULTI_DEST_CAROUSEL_WEBSITE = 25;
+  MODEL_EXPLORER_WEBSITE = 26;
+  VIDEO_PLAYABLE_WEBSITE = 27;
+  IMAGE_COLLECTION_WEBSITE = 29;
 }
 
 enum AgeBucket {

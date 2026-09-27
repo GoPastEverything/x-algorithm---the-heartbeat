@@ -63,7 +63,11 @@ pub struct Config {
     #[arg(long, default_value_t = 64, env = "KAFKA_MAX_IN_FLIGHT")]
     pub kafka_max_in_flight: usize,
 
-    #[arg(long, default_value = "coredata", env = "KAFKA_PRODUCER_MTLS_CLUSTER")]
+    #[arg(
+        long,
+        default_value = "mltraining",
+        env = "KAFKA_PRODUCER_MTLS_CLUSTER"
+    )]
     pub kafka_producer_mtls_cluster: String,
 
     #[arg(long, default_value = "atla", env = "KAFKA_PRODUCER_MTLS_ZONE")]
@@ -206,6 +210,15 @@ pub struct Config {
     #[arg(long, default_value_t = 500_000, env = "MAX_POST_ENFORCEMENTS_PER_DAY")]
     pub max_post_enforcements_per_day: u32,
 
+    #[arg(long, env = "OVERTURN_HOLD_LEDGER_URL")]
+    pub overturn_hold_ledger_url: Option<String>,
+
+    #[arg(long, env = "OVERTURN_HOLD_STARTUP_PROBE")]
+    pub overturn_hold_startup_probe: Option<String>,
+
+    #[arg(long, env = "OVERTURN_HOLD_ENV")]
+    pub overturn_hold_env: Option<String>,
+
     #[arg(long, default_value_t = 86400, env = "DEDUP_TTL_SECS")]
     pub dedup_ttl_secs: u64,
 
@@ -252,10 +265,48 @@ mod tests {
     }
 
     #[test]
-    fn coredata_producer_defaults_use_mtls() {
+    fn overturn_hold_ledger_url_defaults_unset() {
+        let config = Config::parse_from(["xai-abuse-enforcement-service"]);
+        assert_eq!(config.overturn_hold_ledger_url, None);
+        let config = Config::parse_from([
+            "xai-abuse-enforcement-service",
+            "--overturn-hold-ledger-url=http://ledger.example.invalid:8080",
+        ]);
+        assert_eq!(
+            config.overturn_hold_ledger_url.as_deref(),
+            Some("http://ledger.example.invalid:8080")
+        );
+        assert!(format!("{config:?}").contains("http://ledger.example.invalid:8080"));
+    }
+
+    #[test]
+    fn overturn_hold_startup_probe_defaults_off() {
+        let config = Config::parse_from(["xai-abuse-enforcement-service"]);
+        assert_eq!(config.overturn_hold_startup_probe, None);
+        assert!(!crate::overturn_hold::startup_probe_requested(
+            config.overturn_hold_startup_probe.as_deref()
+        ));
+        let config = Config::parse_from([
+            "xai-abuse-enforcement-service",
+            "--overturn-hold-startup-probe=1",
+        ]);
+        assert!(crate::overturn_hold::startup_probe_requested(
+            config.overturn_hold_startup_probe.as_deref()
+        ));
+        let config = Config::parse_from([
+            "xai-abuse-enforcement-service",
+            "--overturn-hold-startup-probe=0",
+        ]);
+        assert!(!crate::overturn_hold::startup_probe_requested(
+            config.overturn_hold_startup_probe.as_deref()
+        ));
+    }
+
+    #[test]
+    fn mltraining_producer_defaults_use_mtls() {
         let config = Config::parse_from(["xai-abuse-enforcement-service"]);
 
-        assert_eq!(config.kafka_producer_mtls_cluster, "coredata");
+        assert_eq!(config.kafka_producer_mtls_cluster, "mltraining");
         assert_eq!(config.kafka_producer_mtls_zone, "atla");
     }
 }

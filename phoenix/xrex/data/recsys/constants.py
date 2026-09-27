@@ -177,6 +177,9 @@ notification_engagement_to_action_types = {
     "IsNotificationSent": [
         "ClientNotificationSent",
     ],
+    "IsNotificationSettingOptedOut": [
+        "ClientNotificationSettingOptOut",
+    ],
 }
 
 SEARCH_RELEVANCE_ACTION_INDICES = [
@@ -281,6 +284,36 @@ ads_p_conv_click_engagement_to_action_types = {
     ],
     "IsSearchConversion": [
         "AdsSearchConversion",
+    ],
+    "IsAttributedKeyClickConversionDelayed": [
+        "AdsAttributedKeyClickConversionDelayed",
+    ],
+    "IsAttributedClickConversionDelayed": [
+        "AdsAttributedClickConversionDelayed",
+    ],
+    "IsPurchaseConversionDelayed": [
+        "AdsPurchaseConversionDelayed",
+    ],
+    "IsMidFunnelConversionDelayed": [
+        "AdsMidFunnelConversionDelayed",
+    ],
+    "IsAddToCartConversionDelayed": [
+        "AdsAddToCartConversionDelayed",
+    ],
+    "IsUpperFunnelConversionDelayed": [
+        "AdsUpperFunnelConversionDelayed",
+    ],
+    "IsWebConversionDelayed": [
+        "AdsWebConversionDelayed",
+    ],
+    "IsSearchConversionDelayed": [
+        "AdsSearchConversionDelayed",
+    ],
+    "IsSignupConversionDelayed": [
+        "AdsSignUpConversionDelayed",
+    ],
+    "IsCheckoutInitiatedConversionDelayed": [
+        "AdsCheckoutInitiatedConversionDelayed",
     ],
     "IsAttributedKeyViewConversion": [
         "AdsAttributedKeyViewConversion",
@@ -418,9 +451,9 @@ VIEW_THROUGH_ACTION_INDICES = [
     recsys_pb2.ActionName.ADS_UPPER_FUNNEL_CONVERSION_VIEW_THROUGH,
 ]
 
-SOURCE_SPLIT_CONVERSION_HEAD_INDICES = (
-    CLICK_CONDITIONED_ACTION_INDICES + VIEW_THROUGH_ACTION_INDICES
-)
+STANDARD_CONVERSION_HEAD_INDICES = CLICK_CONDITIONED_ACTION_INDICES + VIEW_THROUGH_ACTION_INDICES
+
+PURCHASE_VALUE_ACTION_INDEX = recsys_pb2.ContinuousActionName.ADS_WEB_CT_PURCHASE_VALUE
 
 NEGATIVE_FEEDBACK_HEAD_INDICES = [
     recsys_pb2.ActionName.CLIENT_TWEET_REPORT,

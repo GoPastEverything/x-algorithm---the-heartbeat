@@ -17,7 +17,8 @@ const CACHE_FALLBACK_KEYS: &str = "safety_labels_cache_fallback_keys";
 const BATCH_SIZE: &str = "safety_labels_lookup_batch_size";
 const CACHE_WARM_KEYS: &str = "safety_labels_cache_warm_keys";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum RequestOutcome {
     Started,
     Cancelled,
@@ -25,48 +26,22 @@ pub(crate) enum RequestOutcome {
     Failure,
 }
 
-impl RequestOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Cancelled => "cancelled",
-            Self::Success => "success",
-            Self::Failure => "failure",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum SourceOutcome {
     Success,
     Failure,
 }
 
-impl SourceOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Failure => "failure",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum CacheTier {
     Local,
     Twemcache,
 }
 
-impl CacheTier {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Twemcache => "twemcache",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum CacheResult {
     Hit,
     NotFound,
@@ -74,47 +49,19 @@ pub(crate) enum CacheResult {
     Expired,
 }
 
-impl CacheResult {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Hit => "hit",
-            Self::NotFound => "not_found",
-            Self::Miss => "miss",
-            Self::Expired => "expired",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum ManhattanResult {
     Success,
     Failed,
 }
 
-impl ManhattanResult {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Success => "success",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum BatchStage {
     Request,
     LocalMiss,
     ManhattanFallback,
-}
-
-impl BatchStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Request => "request",
-            Self::LocalMiss => "local_miss",
-            Self::ManhattanFallback => "manhattan_fallback",
-        }
-    }
 }
 
 pub(crate) struct RequestMetricsGuard {
@@ -124,11 +71,7 @@ pub(crate) struct RequestMetricsGuard {
 
 impl RequestMetricsGuard {
     pub(crate) fn new() -> Self {
-        incr(
-            REQUESTS,
-            &[("outcome", RequestOutcome::Started.as_str())],
-            1,
-        );
+        incr(REQUESTS, &[("outcome", RequestOutcome::Started.into())], 1);
         Self {
             start: Instant::now(),
             outcome: Cell::new(RequestOutcome::Cancelled),
@@ -146,7 +89,7 @@ impl RequestMetricsGuard {
 
 impl Drop for RequestMetricsGuard {
     fn drop(&mut self) {
-        let outcome = self.outcome.get().as_str();
+        let outcome = <&str>::from(self.outcome.get());
         incr(REQUESTS, &[("outcome", outcome)], 1);
         observe(
             LATENCY_MS,
@@ -163,32 +106,28 @@ pub(crate) fn record_lookup_tweet_ids(success: usize, failed: usize) {
 }
 
 pub(crate) fn record_lookup_failures(kind: FailureKind, count: usize) {
-    incr_nonzero(FAILURES, &[("kind", kind.as_str())], count as u64);
+    incr_nonzero(FAILURES, &[("kind", kind.into())], count as u64);
 }
 
 pub(crate) fn record_source_request(source: LabelSource, outcome: SourceOutcome, elapsed_ms: f64) {
     incr(
         SOURCE_REQUESTS,
-        &[("source", source.as_str()), ("outcome", outcome.as_str())],
+        &[("source", source.into()), ("outcome", outcome.into())],
         1,
     );
-    observe_vm(
-        SOURCE_LATENCY_MS,
-        &[("source", source.as_str())],
-        elapsed_ms,
-    );
+    observe_vm(SOURCE_LATENCY_MS, &[("source", source.into())], elapsed_ms);
 }
 
 pub(crate) fn record_cache_keys(tier: CacheTier, result: CacheResult, count: usize) {
     incr_nonzero(
         CACHE_KEYS,
-        &[("tier", tier.as_str()), ("result", result.as_str())],
+        &[("tier", tier.into()), ("result", result.into())],
         count as u64,
     );
 }
 
 pub(crate) fn record_manhattan_keys(result: ManhattanResult, count: usize) {
-    incr_nonzero(MANHATTAN_KEYS, &[("result", result.as_str())], count as u64);
+    incr_nonzero(MANHATTAN_KEYS, &[("result", result.into())], count as u64);
 }
 
 pub(crate) fn record_cache_fallback_keys(
@@ -198,46 +137,29 @@ pub(crate) fn record_cache_fallback_keys(
 ) {
     incr_nonzero(
         CACHE_FALLBACK_KEYS,
-        &[("source", source.as_str()), ("reason", reason.as_str())],
+        &[("source", source.into()), ("reason", reason.into())],
         count as u64,
     );
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum WarmKeyResult {
     EligibleMiss,
-    SampledOut,
     Enqueued,
     DroppedChannelFull,
     FetchIssued,
     FetchFailed,
 }
 
-impl WarmKeyResult {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::EligibleMiss => "eligible_miss",
-            Self::SampledOut => "sampled_out",
-            Self::Enqueued => "enqueued",
-            Self::DroppedChannelFull => "dropped_channel_full",
-            Self::FetchIssued => "fetch_issued",
-            Self::FetchFailed => "fetch_failed",
-        }
-    }
-}
-
 pub(crate) fn record_cache_warm_keys(result: WarmKeyResult, count: usize) {
-    incr_nonzero(
-        CACHE_WARM_KEYS,
-        &[("result", result.as_str())],
-        count as u64,
-    );
+    incr_nonzero(CACHE_WARM_KEYS, &[("result", result.into())], count as u64);
 }
 
 pub(crate) fn record_batch_size(stage: BatchStage, size: usize) {
     observe(
         BATCH_SIZE,
-        &[("stage", stage.as_str())],
+        &[("stage", stage.into())],
         size as f64,
         HistogramBuckets::Bucket50To500,
     );

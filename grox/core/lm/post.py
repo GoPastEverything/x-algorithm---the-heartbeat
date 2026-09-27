@@ -53,13 +53,6 @@ class PostRenderer:
         res.append(f'\n{indent_str}User Name: "{post.user.name}"')
         if include_bio and post.user.bio:
             res.append(f'\n{indent_str}User Bio: "{post.user.bio}"')
-        all_media = list(post.media or []) + list(post.url_videos or [])
-        if all_media:
-            res.append(f"\n{indent_str}Media:")
-            if max_media is not None:
-                all_media = all_media[:max_media]
-            for idx, m in enumerate(all_media):
-                res.extend(m.to_convo(idx))
         formatted_text = (
             post.full_text.replace("\n", f"\n{indent_str}") if post.full_text else ""
         )
@@ -77,6 +70,13 @@ class PostRenderer:
         urls = [url for url in post.urls or [] if url]
         if urls:
             res.append(f"\n{indent_str}The Post contains these URLs: {', '.join(urls)}")
+        all_media = list(post.media or []) + list(post.url_videos or [])
+        if all_media:
+            res.append(f"\n{indent_str}Media:")
+            if max_media is not None:
+                all_media = all_media[:max_media]
+            for idx, m in enumerate(all_media):
+                res.extend(m.to_convo(idx))
         if post.broadcast_metadata:
             res.extend(post.broadcast_metadata.to_convo())
         if cards_note_override is not None:
@@ -101,8 +101,17 @@ class PostRenderer:
         if post.space_metadata:
             res.extend(post.space_metadata.to_convo())
         if post.quoted_post:
+            quoted_user = post.quoted_post.user
+            by = (
+                f" by @{quoted_user.handle}"
+                if quoted_user and quoted_user.handle
+                else ""
+            )
+            if by and post.user and post.user.handle == quoted_user.handle:
+                by += " (this Post's author, quoting their OWN post)"
             res.append(
-                f"\n\n{indent_str}This Post quotes Post {post.quoted_post.id}\n\n"
+                f"\n\n{indent_str}This Post quotes Post {post.quoted_post.id}{by};"
+                " the quoted content below is embedded within this Post\n\n"
             )
             res.extend(
                 cls.render(

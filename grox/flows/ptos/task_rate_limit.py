@@ -25,6 +25,23 @@ class TaskRateLimitSafetyPtosAnnotationWithPost(TaskTTLDedupeWithPost):
         return cls._dedupe(post.id, cache, name)
 
 
+class TaskRateLimitSafetyPtosAdultContentLeadingFrames(TaskTTLDedupeWithPost):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos adult content leading frames"
+
+
+class TaskRateLimitSafetyPtosKeyFrames(TaskTTLDedupeWithPost):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos key frames"
+
+
+class TaskRateLimitSafetyPtosMediaInjectedAdultInfraredVideoSpamDetection(
+    TaskTTLDedupeWithPost
+):
+    DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
+    DEDUPE_NAME = "safety ptos media injected adult infrared video spam detection"
+
+
 class TaskRateLimitSafetyPtosRealtimeWithSignals(TaskTTLDedupeWithPost):
     DEDUPE_CACHE = TTLCache(maxsize=10_000, ttl=60)
     DEDUPE_NAME = "safety ptos realtime with signals"

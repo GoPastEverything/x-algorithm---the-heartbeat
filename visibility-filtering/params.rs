@@ -7,8 +7,8 @@ use xai_feature_switches::{FeatureSwitches, RecipientBuilder, Value};
 
 pub const NSFW_GATING_COUNTRIES_KEY: &str = "rust_vf_nsfw_gating_countries";
 
-pub const SCALA_NSFW_GATING_FILE: &str = "country_specific_nsfw_content_gating.yml";
-pub const SCALA_NSFW_GATING_COUNTRIES_KEY: &str = "country_specific_nsfw_content_gating_countries";
+const SCALA_NSFW_GATING_FILE: &str = "country_specific_nsfw_content_gating.yml";
+const SCALA_NSFW_GATING_COUNTRIES_KEY: &str = "country_specific_nsfw_content_gating_countries";
 
 const DRIFT_COUNTER: &str = "nsfw_gating_countries_drift";
 
@@ -21,12 +21,12 @@ pub fn default_nsfw_gating_countries() -> Vec<String> {
     .to_vec()
 }
 
-pub struct NsfwGatingCountries {
+pub(crate) struct NsfwGatingCountries {
     countries: ArcSwap<Vec<String>>,
 }
 
 impl NsfwGatingCountries {
-    pub fn new() -> Self {
+    pub fn starting_at_default() -> Self {
         Self {
             countries: ArcSwap::from_pointee(default_nsfw_gating_countries()),
         }
@@ -34,11 +34,6 @@ impl NsfwGatingCountries {
 
     pub fn contains(&self, country_code: &str) -> bool {
         self.countries.load().iter().any(|c| c == country_code)
-    }
-
-    pub fn refresh_from(&self, feature_switches: &FeatureSwitches) {
-        let (_, resolved) = resolve_with_origin(feature_switches);
-        self.countries.store(Arc::new(resolved));
     }
 
     pub fn refresh_and_check_drift(&self, feature_switches: &FeatureSwitches, fs_path: &str) {
@@ -60,12 +55,6 @@ impl NsfwGatingCountries {
                 cache.refresh_and_check_drift(&feature_switches, &fs_path);
             }
         });
-    }
-}
-
-impl Default for NsfwGatingCountries {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -143,18 +132,21 @@ fn set_eq(a: &[String], b: &[String]) -> bool {
 mod tests {
     use super::*;
 
+    const ABSENT_FS_FILE: &str = "/nonexistent/rust_vf.yml";
+
     fn engine(yaml: &str) -> FeatureSwitches {
         FeatureSwitches::load_string(yaml).unwrap()
     }
 
     #[test]
     fn refresh_reads_key_and_fails_open() {
-        let cache = NsfwGatingCountries::new();
+        let cache = NsfwGatingCountries::starting_at_default();
         assert!(cache.contains("de"));
         assert!(!cache.contains("xx"));
 
-        cache.refresh_from(&engine(
-            r#"
+        cache.refresh_and_check_drift(
+            &engine(
+                r#"
 rust_vf:
   parameters:
     rust_vf_nsfw_gating_countries:
@@ -162,20 +154,23 @@ rust_vf:
       default:
       - "XX"
 "#,
-        ));
+            ),
+            ABSENT_FS_FILE,
+        );
         assert!(cache.contains("xx"));
         assert!(!cache.contains("de"));
 
-        cache.refresh_from(&engine("other:\n  parameters: {}\n"));
+        cache.refresh_and_check_drift(&engine("other:\n  parameters: {}\n"), ABSENT_FS_FILE);
         assert!(cache.contains("de"));
         assert!(!cache.contains("xx"));
     }
 
     #[test]
     fn malformed_value_falls_back_whole_not_partial() {
-        let cache = NsfwGatingCountries::new();
-        cache.refresh_from(&engine(
-            r#"
+        let cache = NsfwGatingCountries::starting_at_default();
+        cache.refresh_and_check_drift(
+            &engine(
+                r#"
 rust_vf:
   parameters:
     rust_vf_nsfw_gating_countries:
@@ -184,7 +179,9 @@ rust_vf:
       - "xx"
       - 7
 "#,
-        ));
+            ),
+            ABSENT_FS_FILE,
+        );
         assert!(!cache.contains("xx"));
         assert!(cache.contains("de"));
     }

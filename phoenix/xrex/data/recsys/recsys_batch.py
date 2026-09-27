@@ -214,6 +214,8 @@ class PostSeq(TypedDict):
     promoted_ids: npt.NDArray[np.int64] | None
     line_item_objective: npt.NDArray[np.int16] | None
     trained_candidate_mask: NotRequired[npt.NDArray[np.bool_] | None]
+    value_label_valid: NotRequired[npt.NDArray[np.bool_]]
+    value_baseline_mean_usd: NotRequired[npt.NDArray[np.float32]]
     safety_label_mask: npt.NDArray[np.int64] | None
     embedding: npt.NDArray[np.float32] | jax.Array | None
     search_query_embeddings: npt.NDArray[np.float32] | None
@@ -307,8 +309,47 @@ class RecsysFeaturesBatch(TypedDict):
     user_installed_apps_multihot: npt.NDArray[np.bool_]
     num_positive_candidates: npt.NDArray[np.int32] | None
     sample_weights: NotRequired[npt.NDArray[np.float32] | None]
-    sample_source: NotRequired[npt.NDArray[np.bool_] | None]
+    sample_source: NotRequired[npt.NDArray[np.int8] | None]
     packing_layout: NotRequired[SequencePackedLayout | None]
+
+
+VALUE_LABEL_DTYPES = {
+    "value_label_valid": np.bool_,
+    "value_baseline_mean_usd": np.float32,
+}
+
+
+def _read_value_labels(
+    record_batch: pa.RecordBatch, shape: tuple[int, int]
+) -> dict[str, np.ndarray]:
+    labels: dict[str, np.ndarray] = {
+        key: np.zeros(shape, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
+    }
+    for key, column, arrow_type in (
+        ("value_label_valid", "valueLabelValidSeq", pa.bool_()),
+        ("value_baseline_mean_usd", "valueBaselineMeanUsdSeq", pa.float32()),
+    ):
+        if column not in record_batch.schema.names:
+            continue
+        col = record_batch.column(column)
+        if col.type != pa.list_(arrow_type, shape[1]):
+            raise ValueError(f"{column} must have type {pa.list_(arrow_type, shape[1])}")
+        values = col.values.slice(col.offset * shape[1], shape[0] * shape[1])
+        values = values.fill_null(False if key == "value_label_valid" else 0.0)
+        labels[key] = (
+            values.to_numpy(zero_copy_only=False).reshape(shape).astype(VALUE_LABEL_DTYPES[key])
+        )
+        labels[key][col.is_null().to_numpy(zero_copy_only=False)] = 0
+    return labels
+
+
+def _extend_value_labels(post_seq: PostSeq, shape: tuple[int, int]) -> dict[str, np.ndarray]:
+    labels = {key: np.zeros(shape, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()}
+    for key in labels:
+        values = post_seq.get(key)
+        if isinstance(values, np.ndarray):
+            labels[key][:, : values.shape[1]] = values
+    return labels
 
 
 def _extract_feature_columns(
@@ -403,6 +444,8 @@ def from_record_batch(
         continuous_actions = np.zeros(
             (batch_size, seq_len, num_continuous_actions), dtype=np.float32
         )
+
+    value_labels = _read_value_labels(record_batch, (batch_size, actions.shape[1]))
 
     if "clientAppIdSeq" in record_batch.schema.names:
         client_app_id = _col(record_batch, "clientAppIdSeq", batch_size, np.int32)
@@ -582,6 +625,9 @@ def from_record_batch(
     candidate_product_surface = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_client_app_id = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_trained_mask = np.ones(cand_shape_2d, dtype=np.bool_)
+    candidate_value_labels: dict[str, np.ndarray] = {
+        key: np.zeros(cand_shape_2d, dtype=dtype) for key, dtype in VALUE_LABEL_DTYPES.items()
+    }
     candidate_post_creation_ts_sec = np.zeros(cand_shape_2d, dtype=np.int32)
     candidate_actions = np.zeros(cand_shape_3d, dtype=actions.dtype)
     candidate_continuous_actions = np.zeros(
@@ -746,6 +792,8 @@ def from_record_batch(
             candidate_post_creation_ts_sec[*cslice] = post_creation_ts_sec[*dslice]
             candidate_actions[*cslice] = actions[*dslice, :]
             candidate_continuous_actions[*cslice] = continuous_actions[*dslice, :]
+            for key, values in value_labels.items():
+                candidate_value_labels[key][*cslice] = values[*dslice]
             candidate_promoted_ids[*cslice] = promoted_ids[*dslice]
             candidate_line_item_objective[*cslice] = line_item_objective[*dslice]
             candidate_safety_label_mask[*cslice] = safety_label_mask[*dslice]
@@ -831,6 +879,8 @@ def from_record_batch(
             candidate_post_creation_ts_sec[not_found] = 0
             candidate_actions[not_found] = 0
             candidate_continuous_actions[not_found] = 0
+            for values in candidate_value_labels.values():
+                values[not_found] = 0
             candidate_promoted_ids[not_found] = 0
             candidate_line_item_objective[not_found] = 0
             candidate_safety_label_mask[not_found] = 0
@@ -923,6 +973,7 @@ def from_record_batch(
         client_app_id=candidate_client_app_id,
         post_ids=candidate_post_ids if include_candidate_post_ids else None,
         trained_candidate_mask=candidate_trained_mask,
+        **candidate_value_labels,
         continuous_actions=candidate_continuous_actions,
         promoted_ids=candidate_promoted_ids,
         line_item_objective=candidate_line_item_objective,
@@ -981,13 +1032,13 @@ def from_record_batch(
             else np.ones((batch_size, 1), dtype=np.float32)
         ),
         sample_source=(
-            record_batch.column("is_delayed_feedback")
-            .fill_null(False)
+            record_batch.column("sample_source")
+            .fill_null(0)
             .to_numpy(zero_copy_only=False)
-            .astype(np.bool_)
+            .astype(np.int8)
             .reshape(-1, 1)
-            if "is_delayed_feedback" in record_batch.schema.names
-            else np.zeros((batch_size, 1), dtype=np.bool_)
+            if "sample_source" in record_batch.schema.names
+            else np.zeros((batch_size, 1), dtype=np.int8)
         ),
     )
     batch["num_positive_candidates"] = (
@@ -1267,6 +1318,7 @@ def apply_negative_sampling(
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
         trained_candidate_mask=new_trained_mask,
+        **_extend_value_labels(post_seq, (batch_size, total_candidate_slots)),
         continuous_actions=new_continuous_actions,
         promoted_ids=new_promoted_ids,
         line_item_objective=new_line_item_objective,
@@ -1499,6 +1551,7 @@ def apply_global_negative_sampling(
         client_app_id=new_client_app_id,
         post_ids=new_post_ids,
         trained_candidate_mask=new_gn_trained_mask,
+        **_extend_value_labels(post_seq, (batch_size, expanded_candidate_slots)),
         continuous_actions=new_continuous_actions,
         promoted_ids=new_promoted_ids,
         line_item_objective=new_line_item_objective,

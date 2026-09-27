@@ -42,6 +42,7 @@ use crate::filters::brazil_2026_election_filter::Brazil2026ElectionFilter;
 use crate::filters::core_data_hydration_filter::CoreDataHydrationFilter;
 use crate::filters::dedup_conversation_filter::DedupConversationFilter;
 use crate::filters::drop_duplicates_filter::DropDuplicatesFilter;
+use crate::filters::fav_holdout_filter::FavHoldoutFilter;
 use crate::filters::ineligible_subscription_filter::IneligibleSubscriptionFilter;
 use crate::filters::inventory_holdout_filter::InventoryHoldoutFilter;
 use crate::filters::new_user_min_engagement_filter::NewUserMinEngagementFilter;
@@ -78,7 +79,6 @@ use crate::query_hydrators::user_demographics_query_hydrator::UserDemographicsQu
 use crate::query_hydrators::user_inferred_gender_query_hydrator::UserInferredGenderQueryHydrator;
 use crate::query_hydrators::user_installed_apps_query_hydrator::UserInstalledAppsQueryHydrator;
 use crate::scorers::phoenix_scorer::PhoenixScorer;
-use crate::scorers::ranking_scorer::RankingScorer;
 use crate::scorers::vm_ranker::VMRanker;
 use crate::selectors::TopKScoreSelector;
 use crate::side_effects::author_served_metrics_side_effect::AuthorServedMetricsSideEffect;
@@ -88,6 +88,8 @@ use crate::side_effects::phoenix_experiments_side_effect::PhoenixExperimentsSide
 use crate::side_effects::phoenix_request_cache_side_effect::PhoenixRequestCacheSideEffect;
 use crate::side_effects::redis_post_candidate_cache_side_effect::RedisPostCandidateCacheSideEffect;
 use crate::side_effects::reranking_kafka_side_effect::RerankingKafkaSideEffect;
+use crate::side_effects::response_diversity_stats_side_effect::ResponseDiversityStatsSideEffect;
+use crate::side_effects::retrieval_candidates_kafka_side_effect::RetrievalCandidatesKafkaSideEffect;
 use crate::side_effects::scored_stats_side_effect::ScoredStatsSideEffect;
 use crate::sources::cached_posts_source::CachedPostsSource;
 use crate::sources::phoenix_moe_source::PhoenixMOESource;
@@ -109,7 +111,8 @@ use xai_candidate_pipeline::component_library::clients::gender_prediction_client
 };
 use xai_candidate_pipeline::component_library::clients::kafka_publisher_client::{
     KafkaCluster, KafkaPublisherClient, MockKafkaPublisherClient, ProdKafkaPublisherClient,
-    PHOENIX_SCORES_TOPIC, RERANKING_TOPIC,
+    LOGGED_SCORED_CANDIDATES_TOPIC, PHOENIX_SCORES_TOPIC, RERANKING_TOPIC,
+    RETRIEVAL_CANDIDATES_TOPIC,
 };
 use xai_candidate_pipeline::component_library::clients::media_info_cache_client::{
     MediaInfoCacheClient, MockMediaInfoCacheClient, ProdMediaInfoCacheClient,
@@ -201,7 +204,9 @@ impl PhoenixCandidatePipeline {
         xai_vf_client: Arc<dyn VfClient + Send + Sync>,
         redis_client: Arc<dyn RedisClient + Send + Sync>,
         phoenix_kafka_client: Arc<dyn KafkaPublisherClient>,
+        logged_scored_candidates_kafka_client: Arc<dyn KafkaPublisherClient>,
         reranking_kafka_client: Arc<dyn KafkaPublisherClient>,
+        retrieval_candidates_kafka_client: Arc<dyn KafkaPublisherClient>,
         socialgraph_client: Arc<dyn SocialGraphClientOps>,
         vm_ranker_client: Arc<dyn VMRankerClient>,
         vf_safety_labels_client: Arc<dyn TweetSafetyLabelClient>,
@@ -330,7 +335,14 @@ impl PhoenixCandidatePipeline {
                 socialgraph_client: socialgraph_client.clone(),
             }),
             Box::new(core_data_hydrator),
-            Box::new(QuoteHydrator::new(tes_client.clone(), socialgraph_client.clone()).await),
+            Box::new(
+                QuoteHydrator::new(
+                    tes_client.clone(),
+                    socialgraph_client.clone(),
+                    media_info_cache_client.clone(),
+                )
+                .await,
+            ),
             Box::new(MediaInfoHydrator::new(media_info_cache_client).await),
             Box::new(SubscriptionHydrator::new(tes_client.clone()).await),
             Box::new(GizmoduckCandidateHydrator::new(gizmoduck_client).await),
@@ -371,6 +383,7 @@ impl PhoenixCandidatePipeline {
             Box::new(TopicIdsFilter),
             Box::new(NewUserMinEngagementFilter),
             Box::new(InventoryHoldoutFilter),
+            Box::new(FavHoldoutFilter),
         ];
 
         let xds_client = super::build_phoenix_xds_client(phoenix_xds).await;
@@ -395,14 +408,15 @@ impl PhoenixCandidatePipeline {
             feature_switches,
         ));
         let author_cold_start = crate::scorers::author_cold_start::AuthorColdStart { author_rules };
-        let ranking_scorer = Box::new(RankingScorer { author_cold_start });
+
         let xds_vm_ranker_client = super::build_vm_ranker_xds_client(vm_ranker_xds).await;
         let vm_ranker = Box::new(VMRanker {
             client: vm_ranker_client,
             xds_client: xds_vm_ranker_client,
+            author_cold_start,
         });
         let scorers: Vec<Box<dyn Scorer<ScoredPostsQuery, PostCandidate>>> =
-            vec![phoenix_scorer, ranking_scorer, vm_ranker];
+            vec![phoenix_scorer, vm_ranker];
 
         let selector = TopKScoreSelector;
 
@@ -438,10 +452,15 @@ impl PhoenixCandidatePipeline {
                     phoenix_client,
                     xds_client,
                     phoenix_kafka_client,
+                    logged_scored_candidates_kafka_client,
                 )),
                 Box::new(RerankingKafkaSideEffect::new(reranking_kafka_client)),
+                Box::new(RetrievalCandidatesKafkaSideEffect::new(
+                    retrieval_candidates_kafka_client,
+                )),
                 Box::new(RedisPostCandidateCacheSideEffect::new(redis_client)),
                 Box::new(ScoredStatsSideEffect),
+                Box::new(ResponseDiversityStatsSideEffect),
                 Box::new(AuthorServedMetricsSideEffect),
                 Box::new(MutualFollowStatsSideEffect),
                 Box::new(DebugSideEffect),
@@ -493,7 +512,9 @@ impl PhoenixCandidatePipeline {
             phoenix_request_cache_redis_atla_client,
             phoenix_request_cache_redis_pdxa_client,
             phoenix_kafka_client,
+            logged_scored_candidates_kafka_client,
             reranking_kafka_client,
+            retrieval_candidates_kafka_client,
             vm_ranker_client,
             vf_safety_labels_client,
             impression_bloom_filter_client,
@@ -647,7 +668,25 @@ impl PhoenixCandidatePipeline {
             },
             async {
                 Arc::new(
+                    ProdKafkaPublisherClient::new(
+                        LOGGED_SCORED_CANDIDATES_TOPIC,
+                        KafkaCluster::Phoenix,
+                    )
+                    .await,
+                ) as Arc<dyn KafkaPublisherClient>
+            },
+            async {
+                Arc::new(
                     ProdKafkaPublisherClient::new(RERANKING_TOPIC, KafkaCluster::Phoenix).await,
+                ) as Arc<dyn KafkaPublisherClient>
+            },
+            async {
+                Arc::new(
+                    ProdKafkaPublisherClient::new(
+                        RETRIEVAL_CANDIDATES_TOPIC,
+                        KafkaCluster::Phoenix,
+                    )
+                    .await,
                 ) as Arc<dyn KafkaPublisherClient>
             },
             async {
@@ -811,7 +850,9 @@ impl PhoenixCandidatePipeline {
             xai_vf_client,
             redis_client,
             phoenix_kafka_client,
+            logged_scored_candidates_kafka_client,
             reranking_kafka_client,
+            retrieval_candidates_kafka_client,
             flock_socialgraph_client,
             vm_ranker_client,
             vf_safety_labels_client,
@@ -854,7 +895,11 @@ impl PhoenixCandidatePipeline {
         let xai_vf_client = Arc::new(MockVfClient);
         let redis_client = Arc::new(MockRedisClient::default());
         let kafka_client: Arc<dyn KafkaPublisherClient> = Arc::new(MockKafkaPublisherClient);
+        let logged_scored_candidates_kafka_client: Arc<dyn KafkaPublisherClient> =
+            Arc::new(MockKafkaPublisherClient);
         let reranking_kafka_client: Arc<dyn KafkaPublisherClient> =
+            Arc::new(MockKafkaPublisherClient);
+        let retrieval_candidates_kafka_client: Arc<dyn KafkaPublisherClient> =
             Arc::new(MockKafkaPublisherClient);
         let mock_socialgraph: Arc<dyn SocialGraphClientOps> = Arc::new(MockSocialGraphClient);
         let vm_ranker_client: Arc<dyn VMRankerClient> = Arc::new(MockVMRankerClient);
@@ -902,7 +947,9 @@ impl PhoenixCandidatePipeline {
             xai_vf_client,
             redis_client,
             kafka_client,
+            logged_scored_candidates_kafka_client,
             reranking_kafka_client,
+            retrieval_candidates_kafka_client,
             mock_socialgraph,
             vm_ranker_client,
             vf_safety_labels_client,

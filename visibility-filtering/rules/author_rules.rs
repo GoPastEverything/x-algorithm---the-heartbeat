@@ -1,354 +1,226 @@
-use crate::models::VfAction;
-use crate::rules::rule_spec::RuleSpec;
-use crate::rules::RuleContext;
+use crate::models::AuthorLabel;
+use crate::rules::rule_spec::{
+    ActionSpec, Audience, AuthorPredicate, Condition, Predicate, RelationshipPredicate, RuleClause,
+    TweetPredicate, ViewerPredicate,
+};
 use xai_visibility_filtering::models::FilteredReason;
-use xai_x_thrift::user_labels::LabelValue;
 
-pub(super) const AUTHOR_STATE_DROPS: &[RuleSpec] = &[
-    RuleSpec::Author {
-        name: "SuspendedAuthorRule",
-        when: |author| author.is_suspended(),
-        reason: FilteredReason::AuthorIsSuspended,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "DeactivatedAuthorRule",
-        when: |author| author.is_deactivated(),
-        reason: FilteredReason::AuthorIsDeactivated,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "ErasedAuthorRule",
-        when: |author| author.is_erased(),
-        reason: FilteredReason::AuthorAccountIsInactive,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "OffboardedAuthorRule",
-        when: |author| author.is_offboarded(),
-        reason: FilteredReason::AuthorAccountIsInactive,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "ProtectedAuthorDropRule",
-        when: |author| author.is_protected(),
-        reason: FilteredReason::AuthorIsProtected,
-        exempt_follower: true,
-    },
-];
-
-pub(super) const OON_NSFW_AUTHOR_DROPS: &[RuleSpec] = &[
-    RuleSpec::Author {
-        name: "DropNsfwUserAuthorRule",
-        when: |author| author.is_nsfw_user(),
-        reason: FilteredReason::ContainNsfwMedia,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "DropNsfwAdminAuthorRule",
-        when: |author| author.is_nsfw_admin(),
-        reason: FilteredReason::ContainNsfwMedia,
-        exempt_follower: false,
-    },
-];
-
-pub(super) const OON_USER_LABEL_DROPS: &[RuleSpec] = &[
-    RuleSpec::Author {
-        name: "NsfwHighRecallUserLabelRule",
-        when: |author| author.has_user_label(LabelValue::NSFW_HIGH_RECALL),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "NsfwHighPrecisionUserLabelRule",
-        when: |author| author.has_user_label(LabelValue::NSFW_HIGH_PRECISION),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "SpamHighRecallUserLabelRule",
-        when: |author| author.has_user_label(LabelValue::SPAM_HIGH_RECALL),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "CompromisedUserLabelRule",
-        when: |author| author.has_user_label(LabelValue::COMPROMISED),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "ReadOnlyUserLabelRule",
-        when: |author| author.has_user_label(LabelValue::READ_ONLY),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "ImpersonationHighPrecisionUserLabelRule",
-        when: |author| author.has_user_label(LabelValue::IMPERSONATION_HIGH_PRECISION),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "NsfwAvatarImageRule",
-        when: |author| author.has_user_label(LabelValue::NSFW_AVATAR_IMAGE),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "NsfwBannerImageRule",
-        when: |author| author.has_user_label(LabelValue::NSFW_BANNER_IMAGE),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "AbusiveHighRecallRule",
-        when: |author| author.has_user_label(LabelValue::ABUSIVE_HIGH_RECALL),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: true,
-    },
-    RuleSpec::Author {
-        name: "NsfwNearPerfectAuthorRule",
-        when: |author| author.has_user_label(LabelValue::NSFW_NEAR_PERFECT),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: false,
-    },
-    RuleSpec::Author {
-        name: "DoNotAmplifyNonFollowerRule",
-        when: |author| author.has_user_label(LabelValue::DO_NOT_AMPLIFY),
-        reason: FilteredReason::UnspecifiedReason,
-        exempt_follower: true,
-    },
-];
-
-fn viewer_blocks_author(context: &RuleContext<'_>) -> VfAction {
-    if context.viewer().is_logged_out() {
-        return VfAction::Allow;
-    }
-    if context.viewer().blocks_author() {
-        return VfAction::Drop(FilteredReason::AuthorBlockViewer);
-    }
-    VfAction::Allow
-}
-
-fn viewer_mutes_author(context: &RuleContext<'_>) -> VfAction {
-    if context.viewer().is_logged_out() {
-        return VfAction::Allow;
-    }
-    if context.viewer().mutes_author() {
-        return VfAction::Drop(FilteredReason::ViewerMutesAuthor);
-    }
-    VfAction::Allow
-}
-
-fn muted_retweets(context: &RuleContext<'_>) -> VfAction {
-    if context.viewer().is_logged_out() {
-        return VfAction::Allow;
-    }
-    if context.tweet().is_retweet() && context.viewer().mutes_retweets_from_author() {
-        return VfAction::Drop(FilteredReason::UnspecifiedReason);
-    }
-    VfAction::Allow
-}
-
-pub(super) const SOCIALGRAPH_DROPS: &[RuleSpec] = &[
-    RuleSpec::Custom {
-        name: "ViewerBlocksAuthorRule",
-        evaluate: viewer_blocks_author,
-    },
-    RuleSpec::Custom {
-        name: "ViewerMutesAuthorRule",
-        evaluate: viewer_mutes_author,
-    },
-    RuleSpec::Custom {
-        name: "MutedRetweetsRule",
-        evaluate: muted_retweets,
-    },
-];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::{
-        AuthorFeatures, HydratedTweetCandidate, VfAction, ViewerAuthorRelationship, ViewerFeatures,
-    };
-    use crate::rules::fixtures::{author_viewer, candidate, logged_out_viewer, viewer, VIEWER_ID};
-    use crate::rules::{test_context, Rule};
-
-    fn assert_drops(
-        spec: &RuleSpec,
-        viewer: &ViewerFeatures,
-        candidate: &HydratedTweetCandidate,
-        expected: &FilteredReason,
-    ) {
-        let action = spec.evaluate(&test_context(viewer, candidate));
-        assert!(
-            matches!(&action, VfAction::Drop(reason) if reason == expected),
-            "{} should drop with {expected:?}, got {action:?}",
-            spec.name()
-        );
-    }
-
-    fn assert_allows(spec: &RuleSpec, viewer: &ViewerFeatures, candidate: &HydratedTweetCandidate) {
-        let action = spec.evaluate(&test_context(viewer, candidate));
-        assert!(
-            matches!(action, VfAction::Allow),
-            "{} should allow, got {action:?}",
-            spec.name()
-        );
-    }
-
-    fn author_flag_features(name: &str) -> AuthorFeatures {
-        let mut features = AuthorFeatures::default();
-        match name {
-            "SuspendedAuthorRule" => features.is_suspended = true,
-            "DeactivatedAuthorRule" => features.is_deactivated = true,
-            "ErasedAuthorRule" => features.is_erased = true,
-            "OffboardedAuthorRule" => features.is_offboarded = true,
-            "DropNsfwUserAuthorRule" => features.is_nsfw_user = true,
-            "DropNsfwAdminAuthorRule" => features.is_nsfw_admin = true,
-            "ProtectedAuthorDropRule" => features.is_protected = true,
-            _ => panic!("no trigger flags for rule {name}"),
-        }
-        features
-    }
-
-    #[test]
-    fn author_flag_drop_axis() {
-        for spec in AUTHOR_STATE_DROPS.iter().chain(OON_NSFW_AUTHOR_DROPS) {
-            let RuleSpec::Author {
-                name,
-                reason,
-                exempt_follower,
-                ..
-            } = spec
-            else {
-                panic!("{} is not an author drop row", spec.name());
-            };
-            let firing = candidate()
-                .with_author_features(author_flag_features(name))
-                .build();
-            for v in [viewer(VIEWER_ID), logged_out_viewer()] {
-                assert_drops(spec, &v, &firing, reason);
-            }
-            let followed = candidate()
-                .with_author_features(author_flag_features(name))
-                .followed()
-                .build();
-            if *exempt_follower {
-                assert_allows(spec, &viewer(VIEWER_ID), &followed);
-                assert_drops(spec, &logged_out_viewer(), &followed, reason);
-            } else {
-                assert_drops(spec, &viewer(VIEWER_ID), &followed, reason);
-            }
-            let unflagged = candidate().build();
-            assert_allows(spec, &viewer(VIEWER_ID), &unflagged);
-            assert_allows(spec, &author_viewer(), &firing);
-        }
-    }
-
-    fn trigger_user_label(name: &str) -> LabelValue {
-        match name {
-            "NsfwHighRecallUserLabelRule" => LabelValue::NSFW_HIGH_RECALL,
-            "NsfwHighPrecisionUserLabelRule" => LabelValue::NSFW_HIGH_PRECISION,
-            "SpamHighRecallUserLabelRule" => LabelValue::SPAM_HIGH_RECALL,
-            "CompromisedUserLabelRule" => LabelValue::COMPROMISED,
-            "ReadOnlyUserLabelRule" => LabelValue::READ_ONLY,
-            "ImpersonationHighPrecisionUserLabelRule" => LabelValue::IMPERSONATION_HIGH_PRECISION,
-            "NsfwAvatarImageRule" => LabelValue::NSFW_AVATAR_IMAGE,
-            "NsfwBannerImageRule" => LabelValue::NSFW_BANNER_IMAGE,
-            "AbusiveHighRecallRule" => LabelValue::ABUSIVE_HIGH_RECALL,
-            "NsfwNearPerfectAuthorRule" => LabelValue::NSFW_NEAR_PERFECT,
-            "DoNotAmplifyNonFollowerRule" => LabelValue::DO_NOT_AMPLIFY,
-            _ => panic!("no trigger user label for rule {name}"),
-        }
-    }
-
-    #[test]
-    fn user_label_drop_axis() {
-        for spec in OON_USER_LABEL_DROPS {
-            let RuleSpec::Author {
-                name,
-                reason,
-                exempt_follower,
-                ..
-            } = spec
-            else {
-                panic!("{} is not a user-label drop row", spec.name());
-            };
-            let firing = candidate()
-                .with_author_user_label(trigger_user_label(name))
-                .build();
-            for v in [viewer(VIEWER_ID), logged_out_viewer()] {
-                assert_drops(spec, &v, &firing, reason);
-            }
-            let followed = candidate()
-                .with_author_user_label(trigger_user_label(name))
-                .followed()
-                .build();
-            if *exempt_follower {
-                assert_allows(spec, &viewer(VIEWER_ID), &followed);
-                assert_drops(spec, &logged_out_viewer(), &followed, reason);
-            } else {
-                assert_drops(spec, &viewer(VIEWER_ID), &followed, reason);
-            }
-            let unrelated = candidate()
-                .with_author_user_label(LabelValue::LOW_QUALITY)
-                .build();
-            assert_allows(spec, &viewer(VIEWER_ID), &unrelated);
-            assert_allows(spec, &author_viewer(), &firing);
-        }
-    }
-
-    fn relationship_trigger(name: &str) -> (ViewerAuthorRelationship, bool, FilteredReason) {
-        match name {
-            "ViewerBlocksAuthorRule" => (
-                ViewerAuthorRelationship {
-                    viewer_blocks_author: true,
-                    ..Default::default()
-                },
-                false,
-                FilteredReason::AuthorBlockViewer,
-            ),
-            "ViewerMutesAuthorRule" => (
-                ViewerAuthorRelationship {
-                    viewer_mutes_author: true,
-                    ..Default::default()
-                },
-                false,
-                FilteredReason::ViewerMutesAuthor,
-            ),
-            "MutedRetweetsRule" => (
-                ViewerAuthorRelationship {
-                    viewer_mutes_retweets_from_author: true,
-                    ..Default::default()
-                },
-                true,
-                FilteredReason::UnspecifiedReason,
-            ),
-            _ => panic!("no relationship trigger for rule {name}"),
-        }
-    }
-
-    #[test]
-    fn socialgraph_relationship_axis() {
-        for spec in SOCIALGRAPH_DROPS {
-            let RuleSpec::Custom { name, .. } = spec else {
-                panic!("{} is not a custom socialgraph row", spec.name());
-            };
-            let (rel, retweet, reason) = relationship_trigger(name);
-            let mut firing = candidate().with_relationship(rel.clone());
-            if retweet {
-                firing = firing.retweet_of(99);
-            }
-            let firing = firing.build();
-            assert_drops(spec, &viewer(VIEWER_ID), &firing, &reason);
-            assert_allows(spec, &logged_out_viewer(), &firing);
-            assert_allows(spec, &viewer(VIEWER_ID), &candidate().build());
-            if *name == "MutedRetweetsRule" {
-                let non_retweet = candidate().with_relationship(rel).build();
-                assert_allows(spec, &viewer(VIEWER_ID), &non_retweet);
-            }
-        }
+const fn author_drop(
+    rule_name: &'static str,
+    when: &'static [Condition],
+    reason: FilteredReason,
+    applies_to: Audience,
+) -> RuleClause {
+    RuleClause {
+        rule_name,
+        when,
+        applies_to,
+        action: ActionSpec::Drop(reason),
     }
 }
+
+const NOT_FOLLOWER: Condition = Condition::Not(Predicate::Relationship(
+    RelationshipPredicate::ViewerFollowsAuthor,
+));
+
+pub(super) const AUTHOR_STATE_DROPS: &[RuleClause] = &[
+    author_drop(
+        "SuspendedAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::IsSuspended,
+        ))],
+        FilteredReason::AuthorIsSuspended,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "DeactivatedAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::IsDeactivated,
+        ))],
+        FilteredReason::AuthorIsDeactivated,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "ErasedAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::IsErased,
+        ))],
+        FilteredReason::AuthorAccountIsInactive,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "OffboardedAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::IsOffboarded,
+        ))],
+        FilteredReason::AuthorAccountIsInactive,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "ProtectedAuthorDropRule",
+        &[
+            Condition::Holds(Predicate::Author(AuthorPredicate::IsProtected)),
+            NOT_FOLLOWER,
+        ],
+        FilteredReason::AuthorIsProtected,
+        Audience::ExceptAuthor,
+    ),
+];
+
+pub(super) const OON_NSFW_AUTHOR_DROPS: &[RuleClause] = &[
+    author_drop(
+        "DropNsfwUserAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::IsNsfwUser,
+        ))],
+        FilteredReason::ContainNsfwMedia,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "DropNsfwAdminAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::IsNsfwAdmin,
+        ))],
+        FilteredReason::ContainNsfwMedia,
+        Audience::ExceptAuthor,
+    ),
+];
+
+pub(super) const OON_NSFW_USER_LABEL_DROPS: &[RuleClause] = &[
+    author_drop(
+        "NsfwHighRecallUserLabelRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::NsfwHighRecall),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "NsfwHighPrecisionUserLabelRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::NsfwHighPrecision),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "NsfwAvatarImageRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::NsfwAvatarImage),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "NsfwBannerImageRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::NsfwBannerImage),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "NsfwNearPerfectAuthorRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::NsfwNearPerfect),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+];
+
+pub(super) const OON_USER_LABEL_DROPS: &[RuleClause] = &[
+    author_drop(
+        "SpamHighRecallUserLabelRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::SpamHighRecall),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "CompromisedUserLabelRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::Compromised),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "ReadOnlyUserLabelRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::ReadOnly),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "ImpersonationHighPrecisionUserLabelRule",
+        &[Condition::Holds(Predicate::Author(
+            AuthorPredicate::HasUserLabel(AuthorLabel::ImpersonationHighPrecision),
+        ))],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "AbusiveHighRecallRule",
+        &[
+            Condition::Holds(Predicate::Author(AuthorPredicate::HasUserLabel(
+                AuthorLabel::AbusiveHighRecall,
+            ))),
+            NOT_FOLLOWER,
+        ],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+    author_drop(
+        "DoNotAmplifyNonFollowerRule",
+        &[
+            Condition::Holds(Predicate::Author(AuthorPredicate::HasUserLabel(
+                AuthorLabel::DoNotAmplify,
+            ))),
+            NOT_FOLLOWER,
+        ],
+        FilteredReason::UnspecifiedReason,
+        Audience::ExceptAuthor,
+    ),
+];
+
+const LOGGED_IN: Condition = Condition::Not(Predicate::Viewer(ViewerPredicate::LoggedOut));
+
+pub(super) const SOCIALGRAPH_DROPS: &[RuleClause] = &[
+    RuleClause {
+        rule_name: "ViewerBlocksAuthorRule",
+        when: &[
+            LOGGED_IN,
+            Condition::Holds(Predicate::Relationship(
+                RelationshipPredicate::ViewerBlocksAuthor,
+            )),
+        ],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::ViewerBlocksAuthor),
+    },
+    RuleClause {
+        rule_name: "ViewerMutesAuthorRule",
+        when: &[
+            LOGGED_IN,
+            Condition::Holds(Predicate::Relationship(
+                RelationshipPredicate::ViewerMutesAuthor,
+            )),
+        ],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::ViewerMutesAuthor),
+    },
+    RuleClause {
+        rule_name: "MutedRetweetsRule",
+        when: &[
+            LOGGED_IN,
+            Condition::Holds(Predicate::Tweet(TweetPredicate::IsRetweet)),
+            Condition::Holds(Predicate::Relationship(
+                RelationshipPredicate::ViewerMutesRetweetsFromAuthor,
+            )),
+        ],
+        applies_to: Audience::Everyone,
+        action: ActionSpec::Drop(FilteredReason::UnspecifiedReason),
+    },
+];

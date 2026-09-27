@@ -1,17 +1,80 @@
+use crate::hydration::Hydrator;
 use crate::models::{
-    AuthorFeatures, HydratedTweetCandidate, SafetyLabel, SafetyLabelMap, SafetyLabelType,
-    TweetFeatures, UserLabelSet, Viewer, ViewerAuthorRelationship, ViewerFeatures,
+    AuthorFeatures, AuthorLabel, ConversationControlFeatures, Decided, HydratedTweetCandidate,
+    LimitedEngagement, LimitedEngagementReason, MediaInterstitial, SafetyLabelMap, SafetyLabelType,
+    TweetFeatures, Verdict, Viewer, ViewerFeatures, ViewerProfile, Withholding,
 };
-use std::collections::{HashMap, HashSet};
-use xai_x_thrift::user_labels::LabelValue;
+use std::collections::HashSet;
+use xai_core_entities::entities::{ConversationControl, ConversationControlArm};
+use xai_visibility_filtering::models::FilteredReason;
+use xai_x_thrift::action::InterstitialReason;
 
 const TWEET_ID: u64 = 1;
-const AUTHOR_ID: u64 = 100;
+pub(super) const AUTHOR_ID: u64 = 100;
 pub(crate) const VIEWER_ID: u64 = 999;
+
+pub(crate) fn allow() -> Verdict {
+    Verdict::Shown {
+        media: None,
+        engagement: None,
+    }
+}
+
+pub(crate) fn dropped(reason: FilteredReason, by: &'static str) -> Verdict {
+    Verdict::Withheld(Decided {
+        value: Withholding::Drop(reason),
+        by,
+    })
+}
+
+pub(crate) fn blurred(reason: InterstitialReason, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        media: Some(Decided {
+            value: MediaInterstitial {
+                legacy: FilteredReason::ContainNsfwMedia,
+                reason,
+            },
+            by,
+        }),
+        engagement: None,
+    }
+}
+
+pub(crate) fn limited(reason: LimitedEngagementReason, by: &'static str) -> Verdict {
+    Verdict::Shown {
+        media: None,
+        engagement: Some(Decided {
+            value: LimitedEngagement(reason),
+            by,
+        }),
+    }
+}
+
+pub(crate) fn blurred_and_limited(blur: Verdict, limit: Verdict) -> Verdict {
+    match (blur, limit) {
+        (Verdict::Shown { media, .. }, Verdict::Shown { engagement, .. }) => {
+            Verdict::Shown { media, engagement }
+        }
+        (blur, limit) => panic!("expected two Shown verdicts, got {blur:?} and {limit:?}"),
+    }
+}
 
 pub(crate) fn viewer(id: u64) -> ViewerFeatures {
     ViewerFeatures {
-        viewer: Viewer::LoggedIn(id),
+        viewer: Viewer::LoggedIn {
+            id,
+            profile: ViewerProfile::default(),
+        },
+        ..Default::default()
+    }
+}
+
+pub(crate) fn viewer_with_profile(profile: ViewerProfile) -> ViewerFeatures {
+    ViewerFeatures {
+        viewer: Viewer::LoggedIn {
+            id: VIEWER_ID,
+            profile,
+        },
         ..Default::default()
     }
 }
@@ -28,9 +91,25 @@ pub(crate) fn logged_out_viewer() -> ViewerFeatures {
 }
 
 pub(crate) fn sensitive_opt_in_viewer() -> ViewerFeatures {
-    ViewerFeatures {
+    viewer_with_profile(ViewerProfile {
         allows_sensitive_media: true,
-        ..viewer(VIEWER_ID)
+        ..ViewerProfile::default()
+    })
+}
+
+pub(super) fn conversation_control(
+    arm: ConversationControlArm,
+    root_author_id: u64,
+) -> ConversationControlFeatures {
+    ConversationControlFeatures {
+        control: ConversationControl {
+            arm,
+            conversation_tweet_author_id: root_author_id,
+            invited_user_ids: vec![],
+            invite_via_mention: None,
+            allowed_country_codes: vec![],
+        },
+        viewer_country: None,
     }
 }
 
@@ -41,15 +120,13 @@ pub(crate) fn candidate() -> CandidateBuilder {
             author_id: AUTHOR_ID,
             ..Default::default()
         },
-        labels: HashMap::new(),
-        user_labels: HashSet::new(),
+        labels: HashSet::new(),
     }
 }
 
 pub(crate) struct CandidateBuilder {
     candidate: HydratedTweetCandidate,
-    labels: HashMap<SafetyLabelType, SafetyLabel>,
-    user_labels: HashSet<LabelValue>,
+    labels: HashSet<SafetyLabelType>,
 }
 
 impl CandidateBuilder {
@@ -58,18 +135,13 @@ impl CandidateBuilder {
         self
     }
 
-    pub(crate) fn author_id(mut self, id: u64) -> Self {
-        self.candidate.author_id = id;
-        self
-    }
-
     pub(crate) fn with_label(mut self, label: SafetyLabelType) -> Self {
-        self.labels.insert(label, SafetyLabel::default());
+        self.labels.insert(label);
         self
     }
 
-    pub(crate) fn with_author_user_label(mut self, label: LabelValue) -> Self {
-        self.user_labels.insert(label);
+    pub(crate) fn with_author_user_label(mut self, label: AuthorLabel) -> Self {
+        self.candidate.author_labels.insert(label);
         self
     }
 
@@ -83,13 +155,9 @@ impl CandidateBuilder {
         self
     }
 
-    pub(crate) fn with_relationship(mut self, relationship: ViewerAuthorRelationship) -> Self {
-        self.candidate.relationship = relationship;
-        self
-    }
-
-    pub(crate) fn followed(mut self) -> Self {
-        self.candidate.relationship.viewer_follows_author = true;
+    pub(crate) fn with_edge(mut self, edge: Hydrator) -> Self {
+        debug_assert!(edge.is_edge(), "{edge:?} is not an edge node");
+        self.candidate.edges = self.candidate.edges.with(edge);
         self
     }
 
@@ -98,8 +166,16 @@ impl CandidateBuilder {
         self
     }
 
+    pub(crate) fn with_conversation_control(
+        mut self,
+        features: ConversationControlFeatures,
+    ) -> Self {
+        self.candidate.conversation_control = Some(features);
+        self
+    }
+
     pub(crate) fn retweet_of(mut self, source_tweet_id: u64) -> Self {
-        self.candidate.tweet_features.core.source_tweet_id = Some(source_tweet_id);
+        self.candidate.tweet_features.source_tweet_id = Some(source_tweet_id);
         self
     }
 
@@ -107,9 +183,6 @@ impl CandidateBuilder {
         let mut candidate = self.candidate;
         if !self.labels.is_empty() {
             candidate.safety_labels = SafetyLabelMap::new(self.labels);
-        }
-        if !self.user_labels.is_empty() {
-            candidate.author_features.user_labels = UserLabelSet::new(self.user_labels);
         }
         candidate
     }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use growthbook_rust_sdk::client::{GrowthBookClient, GrowthBookClientTrait};
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::facts::EntityType;
 use crate::sliding_window::SlidingWindowLimiter;
@@ -50,6 +50,10 @@ pub struct ProducerSpec {
     pub enabled: bool,
     #[serde(default)]
     pub topic: Option<String>,
+    #[serde(default)]
+    pub cluster: Option<String>,
+    #[serde(default)]
+    pub zone: Option<String>,
 }
 
 #[derive(Clone)]
@@ -199,6 +203,10 @@ impl DynamicConfig {
         generic_actions_from_config(self.config().as_ref(), entity_type)
     }
 
+    pub fn overturn_hold_gate(&self) -> crate::overturn_hold::HoldGateConfig {
+        crate::overturn_hold::HoldGateConfig::from_config(self.config().as_ref())
+    }
+
     pub fn config(&self) -> Option<Value> {
         let c = self.client.as_ref()?;
         Some(c.feature_result(GROWTHBOOK_CONFIG_KEY, None).value)
@@ -224,11 +232,15 @@ fn kafka_producers_from_config(config: Option<&Value>) -> HashMap<String, Produc
         return HashMap::new();
     };
     obj.iter()
-        .filter_map(|(name, v)| {
-            serde_json::from_value::<ProducerSpec>(v.clone())
-                .ok()
-                .map(|spec| (name.clone(), spec))
-        })
+        .filter_map(
+            |(name, v)| match serde_json::from_value::<ProducerSpec>(v.clone()) {
+                Ok(spec) => Some((name.clone(), spec)),
+                Err(e) => {
+                    warn!("kafka producer '{name}' config is malformed; sink disabled: {e}");
+                    None
+                }
+            },
+        )
         .collect()
 }
 
@@ -322,6 +334,13 @@ mod tests {
         let dc = cfg_without_gb(false);
         assert!(dc.bool("anything", true));
         assert!(!dc.bool("anything", false));
+    }
+
+    #[test]
+    fn overturn_hold_gate_defaults_off_when_no_client() {
+        let gate = cfg_without_gb(false).overturn_hold_gate();
+        assert_eq!(gate.mode, crate::overturn_hold::GateMode::Off);
+        assert!(!gate.enabled());
     }
 
     #[test]
@@ -586,6 +605,27 @@ mod tests {
 
         assert!(kafka_producers_from_config(Some(&json!({ "other": 1 }))).is_empty());
         assert!(kafka_producers_from_config(None).is_empty());
+    }
+
+    #[test]
+    fn kafka_producers_from_config_carries_optional_cluster_override() {
+        let cfg = json!({
+            "kafka": { "producer": {
+                "decisions": { "enabled": true, "topic": "t1" },
+                "elsewhere": {
+                    "enabled": true,
+                    "topic": "t2",
+                    "cluster": "coredata",
+                    "zone": "pdxa",
+                },
+            } },
+        });
+        let m = kafka_producers_from_config(Some(&cfg));
+
+        assert_eq!(m["decisions"].cluster, None);
+        assert_eq!(m["decisions"].zone, None);
+        assert_eq!(m["elsewhere"].cluster.as_deref(), Some("coredata"));
+        assert_eq!(m["elsewhere"].zone.as_deref(), Some("pdxa"));
     }
 
     #[tokio::test]

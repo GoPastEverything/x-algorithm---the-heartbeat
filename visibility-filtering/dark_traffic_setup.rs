@@ -20,10 +20,11 @@ use xai_x_rpc::xds_channel_factory::XdsChannelFactory;
 
 const CONFIG_PATH: &str = "/config/dark-traffic/dark_traffic.yaml";
 
-pub const STAGING_NAMESPACE: &str = "visibility";
+pub const MIRROR_NAMESPACE: &str = "visibility";
 pub const STAGING_APP_ENV: &str = "staging";
-pub const STAGING_PORT_ID: &str = "grpc";
-pub const STAGING_WORKLOAD_PREFIX: &str = "xai-vf-service";
+pub const DEVEL_APP_ENV: &str = "devel";
+pub const MIRROR_PORT_ID: &str = "grpc";
+pub const MIRROR_WORKLOAD_PREFIX: &str = "xai-vf-service";
 
 const LISTENER_TYPE_URL: &str = "type.googleapis.com/envoy.config.listener.v3.Listener";
 const LDS_MAX_DECODING_MESSAGE_SIZE: usize = 256 * 1024 * 1024;
@@ -34,28 +35,42 @@ pub fn staging_tls_domain(dc: &str) -> String {
     format!("visibility.visibility-filtering-service.staging.{dc}.s2s.twttr.net")
 }
 
+pub fn devel_tls_domain(dc: &str) -> String {
+    format!("visibility.xai-vf-service.devel.{dc}.s2s.twttr.net")
+}
+
 pub type DarkLayer = Either<DarkTrafficLayer, tower::layer::util::Identity>;
 
-pub fn parse_staging_listener(listener_name: &str) -> Option<EndpointInfo> {
+pub fn parse_mirror_listener(listener_name: &str) -> Option<EndpointInfo> {
     let dest = listener_name.rsplit('/').next().unwrap_or(listener_name);
     let dest = dest.split('?').next().unwrap_or(dest);
-    let suffix = format!(".{STAGING_APP_ENV}.{STAGING_NAMESPACE}:{STAGING_PORT_ID}");
-    let workload = dest.strip_suffix(suffix.as_str())?;
-    if !workload.starts_with(STAGING_WORKLOAD_PREFIX) || workload.contains('.') {
+    let (workload, app_env) = [STAGING_APP_ENV, DEVEL_APP_ENV]
+        .into_iter()
+        .find_map(|app_env| {
+            let suffix = format!(".{app_env}.{MIRROR_NAMESPACE}:{MIRROR_PORT_ID}");
+            dest.strip_suffix(&suffix)
+                .map(|workload| (workload, app_env))
+        })?;
+    if !workload.starts_with(MIRROR_WORKLOAD_PREFIX) || workload.contains('.') {
         return None;
     }
+    let name = if app_env == STAGING_APP_ENV {
+        workload.to_string()
+    } else {
+        format!("{workload}.{app_env}")
+    };
     Some(EndpointInfo {
-        name: workload.to_string(),
+        name,
         xds_dest: dest.to_string(),
     })
 }
 
-struct XdsStagingDiscovery {
+struct XdsMirrorDiscovery {
     server_uri: String,
 }
 
 #[async_trait::async_trait]
-impl EndpointDiscovery for XdsStagingDiscovery {
+impl EndpointDiscovery for XdsMirrorDiscovery {
     async fn discover(&self) -> anyhow::Result<Vec<EndpointInfo>> {
         tokio::time::timeout(LDS_RESPONSE_TIMEOUT, self.fetch())
             .await
@@ -63,7 +78,7 @@ impl EndpointDiscovery for XdsStagingDiscovery {
     }
 }
 
-impl XdsStagingDiscovery {
+impl XdsMirrorDiscovery {
     async fn fetch(&self) -> anyhow::Result<Vec<EndpointInfo>> {
         let channel = tonic::transport::Endpoint::from_shared(self.server_uri.clone())
             .context("invalid kube-discovery URI")?
@@ -78,8 +93,8 @@ impl XdsStagingDiscovery {
             type_url: LISTENER_TYPE_URL.to_string(),
             resource_names: vec!["*".to_string()],
             node: Some(Node {
-                id: format!("{STAGING_WORKLOAD_PREFIX}-dark-traffic"),
-                cluster: STAGING_NAMESPACE.to_string(),
+                id: format!("{MIRROR_WORKLOAD_PREFIX}-dark-traffic"),
+                cluster: MIRROR_NAMESPACE.to_string(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -116,13 +131,13 @@ impl XdsStagingDiscovery {
         );
         let endpoints: Vec<EndpointInfo> = names
             .iter()
-            .filter_map(|name| parse_staging_listener(name))
+            .filter_map(|name| parse_mirror_listener(name))
             .collect();
 
         if endpoints.is_empty() {
             tracing::warn!(
                 listeners = names.len(),
-                "dark_traffic: no staging listeners matched"
+                "dark_traffic: no staging or devel listeners matched"
             );
         } else {
             info!(
@@ -135,23 +150,30 @@ impl XdsStagingDiscovery {
     }
 }
 
-struct TimeoutChannelFactory {
-    inner: XdsChannelFactory,
+struct MirrorChannelFactory {
+    staging: XdsChannelFactory,
+    devel: XdsChannelFactory,
 }
 
 #[async_trait::async_trait]
-impl ChannelFactory for TimeoutChannelFactory {
+impl ChannelFactory for MirrorChannelFactory {
     async fn create_channel(&self, ep: &EndpointInfo) -> anyhow::Result<Channel> {
-        tokio::time::timeout(CHANNEL_CREATE_TIMEOUT, self.inner.create_channel(ep))
+        let factory = if ep.xds_dest.contains(&format!(".{DEVEL_APP_ENV}.")) {
+            &self.devel
+        } else {
+            &self.staging
+        };
+        tokio::time::timeout(CHANNEL_CREATE_TIMEOUT, factory.create_channel(ep))
             .await
             .with_context(|| format!("channel dial timed out for {}", ep.xds_dest))?
     }
 }
 
 pub fn resolve_layer() -> DarkLayer {
-    if !std::env::var("DARK_TRAFFIC_ENABLED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    if !std::env::var(crate::config::ENV_DARK_TRAFFIC_ENABLED)
+        .ok()
+        .as_deref()
+        .is_some_and(dark_traffic_enabled)
     {
         info!("dark_traffic: disabled");
         return Either::Right(tower::layer::util::Identity::new());
@@ -175,22 +197,21 @@ pub fn resolve_layer() -> DarkLayer {
     }
 
     let dc = std::env::var("DATACENTER").unwrap_or_else(|_| "atla".to_string());
-    let discovery = XdsStagingDiscovery {
+    let discovery = XdsMirrorDiscovery {
         server_uri: format!("http://frontend.kube-discovery.prod.svc.{dc}.kube.int-x.ai:8082"),
     };
-    let domain = staging_tls_domain(&dc);
-    info!(domain, "dark_traffic: enabled");
+    let staging_domain = staging_tls_domain(&dc);
+    let devel_domain = devel_tls_domain(&dc);
+    info!(staging_domain, devel_domain, "dark_traffic: enabled");
 
-    let factory = XdsChannelFactory::new(
-        TlsMode::mtls_from_env()
-            .expect("S2S TLS config required")
-            .with_domain_override(&domain),
-    );
+    #[expect(clippy::expect_used, reason = "startup fail-fast: TLS is required")]
+    let tls = TlsMode::mtls_from_env().expect("S2S TLS config required");
+    let factory = MirrorChannelFactory {
+        staging: XdsChannelFactory::new(tls.clone().with_domain_override(&staging_domain)),
+        devel: XdsChannelFactory::new(tls.with_domain_override(&devel_domain)),
+    };
 
-    let channels = DynamicChannelManager::new(
-        Arc::new(TimeoutChannelFactory { inner: factory }),
-        Arc::new(discovery),
-    );
+    let channels = DynamicChannelManager::new(Arc::new(factory), Arc::new(discovery));
 
     let config = ReloadableDarkTrafficConfigBuilder::new(CONFIG_PATH)
         .forwarders({
@@ -200,6 +221,10 @@ pub fn resolve_layer() -> DarkLayer {
         .build();
 
     Either::Left(DarkTrafficLayer::new(config))
+}
+
+pub fn dark_traffic_enabled(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true")
 }
 
 fn should_mirror(workload: Option<&str>, ordinal: Option<u32>, max_ordinal: Option<u32>) -> bool {
@@ -223,59 +248,59 @@ mod tests {
     const CANARY: Option<&str> = Some("xai-vf-service-canary");
 
     #[test]
-    fn default_only_pod0() {
-        assert!(should_mirror(PROD, Some(0), None));
-        assert!(!should_mirror(PROD, Some(1), None));
-        assert!(!should_mirror(PROD, Some(99), None));
+    fn should_mirror_only_selected_prod_ordinals() {
+        for (workload, ordinal, max_ordinal, expected) in [
+            (PROD, Some(0), None, true),
+            (PROD, Some(1), None, false),
+            (PROD, None, None, false),
+            (PROD, None, Some(3), false),
+            (PROD, Some(0), Some(3), true),
+            (PROD, Some(2), Some(3), true),
+            (PROD, Some(3), Some(3), false),
+            (CANARY, Some(0), Some(u32::MAX), false),
+            (None, Some(0), Some(11), false),
+        ] {
+            assert_eq!(should_mirror(workload, ordinal, max_ordinal), expected);
+        }
     }
 
     #[test]
-    fn no_ordinal_disables() {
-        assert!(!should_mirror(PROD, None, None));
-        assert!(!should_mirror(PROD, None, Some(3)));
-    }
-
-    #[test]
-    fn max_ordinal_threshold() {
-        assert!(should_mirror(PROD, Some(0), Some(3)));
-        assert!(should_mirror(PROD, Some(1), Some(3)));
-        assert!(should_mirror(PROD, Some(2), Some(3)));
-        assert!(!should_mirror(PROD, Some(3), Some(3)));
-        assert!(!should_mirror(PROD, Some(4), Some(3)));
-    }
-
-    #[test]
-    fn max_ordinal_zero_disables_all() {
-        assert!(!should_mirror(PROD, Some(0), Some(0)));
-    }
-
-    #[test]
-    fn canary_never_mirrors() {
-        assert!(!should_mirror(CANARY, Some(0), Some(11)));
-        assert!(!should_mirror(CANARY, Some(0), Some(u32::MAX)));
-    }
-
-    #[test]
-    fn missing_workload_name_fails_closed() {
-        assert!(!should_mirror(None, Some(0), Some(11)));
-    }
-
-    #[test]
-    fn parse_accepts_vf_staging_listeners() {
-        for (listener, workload) in [
-            ("xai-vf-service.staging.visibility:grpc", "xai-vf-service"),
+    fn parse_accepts_vf_staging_and_devel_listeners() {
+        for (listener, workload, xds_dest) in [
+            (
+                "xai-vf-service.staging.visibility:grpc",
+                "xai-vf-service",
+                "xai-vf-service.staging.visibility:grpc",
+            ),
+            (
+                "xai-vf-service.devel.visibility:grpc",
+                "xai-vf-service.devel",
+                "xai-vf-service.devel.visibility:grpc",
+            ),
+            (
+                "xai-vf-service-pr-123.devel.visibility:grpc",
+                "xai-vf-service-pr-123.devel",
+                "xai-vf-service-pr-123.devel.visibility:grpc",
+            ),
+            (
+                "xdstp://kube-discovery/envoy.config.listener.v3.Listener/xai-vf-service-pr-123.devel.visibility:grpc?key=val",
+                "xai-vf-service-pr-123.devel",
+                "xai-vf-service-pr-123.devel.visibility:grpc",
+            ),
             (
                 "xai-vf-service-user1-foo.staging.visibility:grpc",
                 "xai-vf-service-user1-foo",
+                "xai-vf-service-user1-foo.staging.visibility:grpc",
             ),
             (
                 "xdstp://kube-discovery/envoy.config.listener.v3.Listener/xai-vf-service.staging.visibility:grpc?key=val",
                 "xai-vf-service",
+                "xai-vf-service.staging.visibility:grpc",
             ),
         ] {
-            let ep = parse_staging_listener(listener).expect(listener);
+            let ep = parse_mirror_listener(listener).expect(listener);
             assert_eq!(ep.name, workload);
-            assert_eq!(ep.xds_dest, format!("{workload}.staging.visibility:grpc"));
+            assert_eq!(ep.xds_dest, xds_dest);
         }
     }
 
@@ -283,6 +308,11 @@ mod tests {
     fn parse_rejects_out_of_scope_listeners() {
         for name in [
             "xai-vf-service.prod.visibility:grpc",
+            "xai-vf-service.development.visibility:grpc",
+            "xai-vf-service.staging-devel.visibility:grpc",
+            "xai-vf-service.devel-staging.visibility:grpc",
+            "xai-vf-service.devel.visibility:grpc-extra",
+            "xai-vf-service.devel.visibility:grpc.other",
             "other-svc.staging.visibility:grpc",
             "xai-vf-service.staging.other:grpc",
             "xai-vf-service.staging.visibility:metrics",
@@ -290,7 +320,7 @@ mod tests {
             "xai-vf-service.staging.visibility",
             "",
         ] {
-            assert!(parse_staging_listener(name).is_none(), "{name}");
+            assert!(parse_mirror_listener(name).is_none(), "{name}");
         }
     }
 }

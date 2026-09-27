@@ -1,53 +1,248 @@
-use crate::models::{HydratedTweetCandidate, ViewerFeatures};
+use crate::hydration::{HydrationPlan, Hydrators};
+use crate::models::{
+    Decided, HydratedTweetCandidate, LimitedEngagement, MediaInterstitial, Verdict, ViewerFeatures,
+    Withholding,
+};
 use crate::params::NsfwGatingCountries;
-use crate::rules::rule_spec::RuleSpec;
+use crate::rules::rule_spec::{ActionSpec, RuleClause, Truth};
+use crate::rules::RuleContext;
 use crate::rules::{author_rules, tweet_rules};
-use crate::rules::{evaluate_rules, Rule, RuleContext, Verdict};
 use std::sync::Arc;
+use strum::VariantArray;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
+#[strum(serialize_all = "snake_case")]
 pub enum SafetyLevel {
     FilterAll,
     TimelineHome,
     TimelineHomeRecommendations,
+    TimelineHomeHydration,
+    ImmersiveExpandedRecommendations,
 }
 
-impl SafetyLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SafetyLevel::FilterAll => "filter_all",
-            SafetyLevel::TimelineHome => "timeline_home",
-            SafetyLevel::TimelineHomeRecommendations => "timeline_home_recommendations",
+pub struct Evaluation {
+    pub verdict: Verdict,
+    pub rested_on: Hydrators,
+}
+
+pub(super) struct Policy<'a> {
+    rules: &'a [&'a [RuleClause]],
+    additional_rules: &'a [&'a [RuleClause]],
+    hydrators: Hydrators,
+}
+
+impl<'a> Policy<'a> {
+    pub(super) const fn new(rules: &'a [&'a [RuleClause]]) -> Self {
+        Self::with_additional(rules, &[])
+    }
+
+    const fn with_additional(
+        rules: &'a [&'a [RuleClause]],
+        additional_rules: &'a [&'a [RuleClause]],
+    ) -> Self {
+        Self {
+            rules,
+            additional_rules,
+            hydrators: hydrators_of(rules).union(hydrators_of(additional_rules)),
         }
+    }
+
+    fn rules(&self) -> impl Iterator<Item = &'a RuleClause> + '_ {
+        self.rules
+            .iter()
+            .chain(self.additional_rules)
+            .copied()
+            .flatten()
+    }
+
+    pub(super) fn evaluate(&self, context: &RuleContext<'_>) -> Evaluation {
+        let mut media = None;
+        let mut engagement = None;
+        let mut withholding_rested_on = Hydrators::empty();
+        let mut slot_rested_on = Hydrators::empty();
+
+        for rule in self.rules() {
+            let truth = rule.applies(context);
+            let unknown_reads = match truth {
+                Truth::Unknown { failed, .. } => failed,
+                Truth::True | Truth::False => Hydrators::empty(),
+            };
+            match &rule.action {
+                ActionSpec::Drop(reason) => {
+                    withholding_rested_on = withholding_rested_on.union(unknown_reads);
+                    if truth.resolves_true() {
+                        return Evaluation {
+                            verdict: Verdict::Withheld(Decided {
+                                value: Withholding::Drop(reason.clone()),
+                                by: rule.rule_name,
+                            }),
+                            rested_on: withholding_rested_on,
+                        };
+                    }
+                }
+                ActionSpec::Tombstone(reason) => {
+                    withholding_rested_on = withholding_rested_on.union(unknown_reads);
+                    if truth.resolves_true() {
+                        return Evaluation {
+                            verdict: Verdict::Withheld(Decided {
+                                value: Withholding::Tombstone(*reason),
+                                by: rule.rule_name,
+                            }),
+                            rested_on: withholding_rested_on,
+                        };
+                    }
+                }
+                ActionSpec::Interstitial {
+                    legacy,
+                    media: reason,
+                } if media.is_none() => {
+                    slot_rested_on = slot_rested_on.union(unknown_reads);
+                    if truth.resolves_true() {
+                        media = Some(Decided {
+                            value: MediaInterstitial {
+                                legacy: legacy.clone(),
+                                reason: reason.clone(),
+                            },
+                            by: rule.rule_name,
+                        });
+                    }
+                }
+                ActionSpec::LimitedEngagement(reason) if engagement.is_none() => {
+                    slot_rested_on = slot_rested_on.union(unknown_reads);
+                    if truth.resolves_true() {
+                        engagement = Some(Decided {
+                            value: LimitedEngagement(*reason),
+                            by: rule.rule_name,
+                        });
+                    }
+                }
+                ActionSpec::Interstitial { .. } | ActionSpec::LimitedEngagement(_) => {}
+            }
+        }
+
+        Evaluation {
+            verdict: Verdict::Shown { media, engagement },
+            rested_on: withholding_rested_on.union(slot_rested_on),
+        }
+    }
+
+    fn rule_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        let mut previous: Option<&'static str> = None;
+        self.rules().filter_map(move |rule| {
+            let repeat = previous == Some(rule.rule_name);
+            previous = Some(rule.rule_name);
+            (!repeat).then_some(rule.rule_name)
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.rule_names().count()
     }
 }
 
-pub struct Policies {
-    filter_all: Vec<Box<dyn Rule>>,
-    timeline_home: Vec<Box<dyn Rule>>,
-    timeline_home_recommendations: Vec<Box<dyn Rule>>,
-    nsfw_gating_countries: Arc<NsfwGatingCountries>,
+const fn hydrators_of(mut groups: &[&[RuleClause]]) -> Hydrators {
+    let mut hydrators = Hydrators::empty();
+    while let [group, tail @ ..] = groups {
+        let mut rules = *group;
+        while let [rule, rest @ ..] = rules {
+            hydrators = hydrators.union(rule.hydrators());
+            rules = rest;
+        }
+        groups = tail;
+    }
+    hydrators
 }
 
-impl Policies {
-    pub fn new() -> Self {
-        Self::with_nsfw_gating_countries(Arc::new(NsfwGatingCountries::new()))
+static FILTER_ALL_POLICY: Policy = Policy::new(&[tweet_rules::FILTER_ALL]);
+
+static TIMELINE_HOME_SHARED_RULES: [&[RuleClause]; 10] = [
+    author_rules::AUTHOR_STATE_DROPS,
+    author_rules::SOCIALGRAPH_DROPS,
+    tweet_rules::TWEET_LABEL_DROPS,
+    tweet_rules::NULLCAST_DROP,
+    tweet_rules::STALE_TWEET_DROP,
+    tweet_rules::TAKEDOWN_DROPS,
+    tweet_rules::SENSITIVE_VIEWER_DROPS,
+    tweet_rules::EXCLUSIVE_TWEET_DROP,
+    tweet_rules::NSFW_MEDIA_INTERSTITIALS,
+    tweet_rules::NSFW_AUTHOR_INTERSTITIAL,
+];
+
+static TIMELINE_HOME_RECOMMENDATION_ONLY_RULES: [&[RuleClause]; 9] = [
+    tweet_rules::RECS_MEDIA_DROPS,
+    author_rules::OON_NSFW_AUTHOR_DROPS,
+    tweet_rules::OON_TWEET_FLAG_DROPS,
+    tweet_rules::OON_GORE_DROP,
+    tweet_rules::OON_NSFW_MEDIA_LABEL_DROPS,
+    tweet_rules::OON_LOW_QUALITY_TWEET_LABEL_DROPS,
+    tweet_rules::OON_TEXT_LABEL_DROPS,
+    author_rules::OON_NSFW_USER_LABEL_DROPS,
+    author_rules::OON_USER_LABEL_DROPS,
+];
+
+static TIMELINE_HOME_POLICY: Policy = Policy::new(&TIMELINE_HOME_SHARED_RULES);
+static TIMELINE_HOME_RECOMMENDATIONS_POLICY: Policy = Policy::with_additional(
+    &TIMELINE_HOME_SHARED_RULES,
+    &TIMELINE_HOME_RECOMMENDATION_ONLY_RULES,
+);
+
+static TIMELINE_HOME_HYDRATION_POLICY: Policy = Policy::new(&[
+    tweet_rules::TWEET_LABEL_DROPS,
+    tweet_rules::EXCLUSIVE_TWEET_DROP,
+    tweet_rules::TAKEDOWN_DROPS,
+    tweet_rules::SENSITIVE_VIEWER_DROPS,
+    tweet_rules::NSFW_MEDIA_INTERSTITIALS,
+    tweet_rules::NSFW_AUTHOR_INTERSTITIAL,
+    tweet_rules::BLOCKED_VIEWER_LIMITED_ACTIONS,
+    tweet_rules::LIMIT_REPLIES_CONVERSATION_RULES,
+    tweet_rules::READ_ONLY_VIEWER_LIMITED_ACTIONS,
+]);
+
+static IMMERSIVE_EXPANDED_RECOMMENDATIONS_POLICY: Policy = Policy::new(&[
+    author_rules::AUTHOR_STATE_DROPS,
+    author_rules::SOCIALGRAPH_DROPS,
+    tweet_rules::TWEET_LABEL_DROPS,
+    tweet_rules::STALE_TWEET_DROP,
+    tweet_rules::TAKEDOWN_DROPS,
+    tweet_rules::SENSITIVE_VIEWER_DROPS,
+    tweet_rules::EXCLUSIVE_TWEET_DROP,
+    tweet_rules::RECS_MEDIA_DROPS,
+    tweet_rules::OON_GORE_DROP,
+    tweet_rules::OON_LOW_QUALITY_TWEET_LABEL_DROPS,
+    author_rules::OON_USER_LABEL_DROPS,
+    tweet_rules::SENSITIVE_MEDIA_OPT_OUT_DROPS,
+]);
+
+pub struct RuleEngine {
+    nsfw_gating_countries: Arc<NsfwGatingCountries>,
+    plans: Vec<HydrationPlan>,
+}
+
+impl RuleEngine {
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::with_nsfw_gating_countries(Arc::new(NsfwGatingCountries::starting_at_default()))
     }
 
     pub fn with_nsfw_gating_countries(gating_countries: Arc<NsfwGatingCountries>) -> Self {
         Self {
-            filter_all: rule_specs(tweet_rules::FILTER_ALL).collect(),
-            timeline_home: timeline_home_policy(),
-            timeline_home_recommendations: timeline_home_recommendations_policy(),
             nsfw_gating_countries: gating_countries,
+            plans: SafetyLevel::VARIANTS
+                .iter()
+                .map(|&level| HydrationPlan::new(level, Self::select(level).hydrators))
+                .collect(),
         }
     }
 
-    fn select(&self, level: SafetyLevel) -> &[Box<dyn Rule>] {
+    fn select(level: SafetyLevel) -> &'static Policy<'static> {
         match level {
-            SafetyLevel::FilterAll => &self.filter_all,
-            SafetyLevel::TimelineHome => &self.timeline_home,
-            SafetyLevel::TimelineHomeRecommendations => &self.timeline_home_recommendations,
+            SafetyLevel::FilterAll => &FILTER_ALL_POLICY,
+            SafetyLevel::TimelineHome => &TIMELINE_HOME_POLICY,
+            SafetyLevel::TimelineHomeRecommendations => &TIMELINE_HOME_RECOMMENDATIONS_POLICY,
+            SafetyLevel::TimelineHomeHydration => &TIMELINE_HOME_HYDRATION_POLICY,
+            SafetyLevel::ImmersiveExpandedRecommendations => {
+                &IMMERSIVE_EXPANDED_RECOMMENDATIONS_POLICY
+            }
         }
     }
 
@@ -56,137 +251,69 @@ impl Policies {
         level: SafetyLevel,
         viewer: &ViewerFeatures,
         candidate: &HydratedTweetCandidate,
-    ) -> Verdict {
-        let context = RuleContext::new(level, viewer, candidate, &self.nsfw_gating_countries);
-        evaluate_rules(self.select(level), &context)
+    ) -> Evaluation {
+        let policy = Self::select(level);
+        let context = RuleContext::new(viewer, candidate, &self.nsfw_gating_countries);
+        #[cfg(test)]
+        let context = context.hydrated_by(policy.hydrators);
+        policy.evaluate(&context)
+    }
+
+    pub(crate) fn plan(&self, level: SafetyLevel) -> &HydrationPlan {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "`plans` maps `SafetyLevel::VARIANTS`, which is in declaration order"
+        )]
+        let plan = &self.plans[level as usize];
+        debug_assert_eq!(plan.level(), level);
+        plan
     }
 
     #[cfg(test)]
     pub(crate) fn wired_rule_names(&self, level: SafetyLevel) -> Vec<&'static str> {
-        self.select(level).iter().map(|rule| rule.name()).collect()
+        Self::select(level).rule_names().collect()
     }
 
     pub fn rule_counts(&self) -> (usize, usize) {
         (
-            self.timeline_home.len(),
-            self.timeline_home_recommendations.len(),
+            TIMELINE_HOME_POLICY.len(),
+            TIMELINE_HOME_RECOMMENDATIONS_POLICY.len(),
         )
     }
-}
-
-impl Default for Policies {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn rule_specs(specs: &'static [RuleSpec]) -> impl Iterator<Item = Box<dyn Rule>> {
-    specs
-        .iter()
-        .map(|spec| Box::new(spec.clone()) as Box<dyn Rule>)
-}
-
-fn base_home_rules() -> Vec<Box<dyn Rule>> {
-    let mut rules: Vec<Box<dyn Rule>> = Vec::new();
-    rules.extend(rule_specs(author_rules::AUTHOR_STATE_DROPS));
-    rules.extend(rule_specs(author_rules::SOCIALGRAPH_DROPS));
-    rules.extend(rule_specs(tweet_rules::TWEET_LABEL_DROPS));
-    rules.extend(rule_specs(tweet_rules::NULLCAST_DROP));
-    rules.extend(rule_specs(tweet_rules::TES_HOME_DROPS));
-    rules.extend(rule_specs(tweet_rules::SENSITIVE_VIEWER_DROPS));
-    rules.extend(rule_specs(tweet_rules::EXCLUSIVE_TWEET_DROP));
-    rules.extend(rule_specs(tweet_rules::NSFW_MEDIA_INTERSTITIALS));
-    rules.extend(rule_specs(tweet_rules::NSFW_AUTHOR_INTERSTITIAL));
-    rules
-}
-
-fn timeline_home_policy() -> Vec<Box<dyn Rule>> {
-    base_home_rules()
-}
-
-fn timeline_home_recommendations_policy() -> Vec<Box<dyn Rule>> {
-    let mut rules = base_home_rules();
-    rules.extend(rule_specs(tweet_rules::RECS_MEDIA_DROPS));
-    rules.extend(rule_specs(author_rules::OON_NSFW_AUTHOR_DROPS));
-    rules.extend(rule_specs(tweet_rules::OON_TWEET_FLAG_DROPS));
-    rules.extend(rule_specs(tweet_rules::OON_TWEET_LABEL_DROPS));
-    rules.extend(rule_specs(author_rules::OON_USER_LABEL_DROPS));
-    rules
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{
-        HydratedTweetCandidate, MediaFeature, TweetFeatures, VfAction, ViewerFeatures,
-    };
-    use crate::rules::fixtures::{author_viewer, candidate, viewer, VIEWER_ID};
-    use xai_visibility_filtering::models::FilteredReason;
-
-    struct RecommendationsOnlyRule;
-
-    impl Rule for RecommendationsOnlyRule {
-        fn name(&self) -> &'static str {
-            "RecommendationsOnlyRule"
-        }
-
-        fn evaluate(&self, context: &RuleContext<'_>) -> VfAction {
-            match context.safety_level() {
-                SafetyLevel::TimelineHomeRecommendations => {
-                    VfAction::Drop(FilteredReason::UnspecifiedReason)
-                }
-                SafetyLevel::FilterAll | SafetyLevel::TimelineHome => VfAction::Allow,
-            }
-        }
-    }
-
-    #[test]
-    fn policies_evaluate_uses_selected_safety_level_in_context() {
-        let policies = Policies {
-            filter_all: vec![Box::new(RecommendationsOnlyRule)],
-            timeline_home: vec![Box::new(RecommendationsOnlyRule)],
-            timeline_home_recommendations: vec![Box::new(RecommendationsOnlyRule)],
-            nsfw_gating_countries: Arc::new(NsfwGatingCountries::new()),
-        };
-        let viewer = ViewerFeatures::default();
-        let candidate = HydratedTweetCandidate::default();
-
-        assert!(matches!(
-            policies
-                .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-                .action,
-            VfAction::Allow
-        ));
-        assert!(matches!(
-            policies
-                .evaluate(
-                    SafetyLevel::TimelineHomeRecommendations,
-                    &viewer,
-                    &candidate
-                )
-                .action,
-            VfAction::Drop(_)
-        ));
-    }
+    use crate::hydration::Hydrator;
+    use crate::models::{ViewerAge, ViewerProfile};
+    use crate::rules::fixtures::{candidate, viewer, viewer_with_profile, VIEWER_ID};
+    use crate::rules::rule_spec::Condition;
+    use crate::rules::{holds_narrowed, test_context};
+    use std::slice;
 
     #[test]
     fn refreshed_config_country_reaches_the_wired_rule() {
-        let gating_countries = Arc::new(NsfwGatingCountries::new());
-        let policies = Policies::with_nsfw_gating_countries(Arc::clone(&gating_countries));
+        let gating_countries = Arc::new(NsfwGatingCountries::starting_at_default());
+        let rule_engine = RuleEngine::with_nsfw_gating_countries(Arc::clone(&gating_countries));
         let candidate = candidate()
             .with_label(crate::models::SafetyLabelType::NSFW_HIGH_PRECISION)
             .with_media()
             .build();
         let viewer = ViewerFeatures {
-            viewer_age: crate::models::ViewerAge::NotStated,
             country_code: Some("us".into()),
-            ..viewer(VIEWER_ID)
+            ..viewer_with_profile(ViewerProfile {
+                viewer_age: ViewerAge::NotStated,
+                ..ViewerProfile::default()
+            })
         };
 
-        let verdict = policies.evaluate(SafetyLevel::TimelineHome, &viewer, &candidate);
-        assert!(!matches!(verdict.action, VfAction::Drop(_)));
+        let verdict = rule_engine
+            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
+            .verdict;
+        assert!(!matches!(verdict, Verdict::Withheld(_)));
 
-        gating_countries.refresh_from(
+        gating_countries.refresh_and_check_drift(
             &xai_feature_switches::FeatureSwitches::load_string(
                 r#"
 rust_vf:
@@ -198,34 +325,28 @@ rust_vf:
 "#,
             )
             .unwrap(),
+            "/nonexistent/rust_vf.yml",
         );
-        let verdict = policies.evaluate(SafetyLevel::TimelineHome, &viewer, &candidate);
-        assert!(matches!(verdict.action, VfAction::Drop(_)));
-        assert_eq!(
-            verdict.decided_by,
-            Some("SensitiveViewerNoStatedAgeDropRule")
-        );
-    }
-
-    #[test]
-    fn filter_all_rule_drops_even_self_view() {
-        let candidate = candidate().build();
-        let viewer = author_viewer();
-        let spec = &tweet_rules::FILTER_ALL[0];
+        let verdict = rule_engine
+            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
+            .verdict;
         assert!(matches!(
-            spec.evaluate(&crate::rules::test_context(&viewer, &candidate)),
-            VfAction::Drop(_)
+            verdict,
+            Verdict::Withheld(Decided {
+                value: Withholding::Drop(_),
+                by: "SensitiveViewerNoStatedAgeDropRule",
+            })
         ));
     }
 
     #[test]
-    fn wired_rule_order_matches_pre_migration_sequence() {
-        let policies = Policies::new();
+    fn wired_rule_order_is_pinned() {
+        let rule_engine = RuleEngine::for_tests();
         assert_eq!(
-            policies.wired_rule_names(SafetyLevel::FilterAll),
+            rule_engine.wired_rule_names(SafetyLevel::FilterAll),
             vec!["FilterAllRule"]
         );
-        let home = policies.wired_rule_names(SafetyLevel::TimelineHome);
+        let home = rule_engine.wired_rule_names(SafetyLevel::TimelineHome);
         assert_eq!(
             home,
             vec![
@@ -253,10 +374,12 @@ rust_vf:
                 "SensitiveViewerUnderageDropRule",
                 "SensitiveViewerNoStatedAgeDropRule",
                 "DropExclusiveTweetContentRule",
+                "NsfwHighPrecisionAdultInterstitialRule",
                 "NsfwHighPrecisionInterstitialRule",
                 "GoreAndViolenceInterstitialRule",
                 "NsfwCardImageInterstitialRule",
-                "NsfwAuthorInterstitialRule",
+                "NsfwAdminInterstitialRule",
+                "NsfwUserInterstitialRule",
             ]
         );
         let mut recs = home.clone();
@@ -267,456 +390,377 @@ rust_vf:
             "DropNsfwAdminAuthorRule",
             "TweetNsfwUserDropRule",
             "TweetNsfwAdminDropRule",
+            "GoreAndViolenceOonDropRule",
             "NsfwHighRecallDropRule",
             "NsfwHighPrecisionOonDropRule",
-            "GoreAndViolenceOonDropRule",
             "NsfwCardImageOonDropRule",
             "DoNotAmplifyOonDropRule",
             "MaliciousUrlOonDropRule",
             "SpamHighRecallDropRule",
-            "NsfwTextTweetLabelDropRule",
             "FosnrAbuseInsultsOonDropRule",
             "NsfwHighRecallUserLabelRule",
             "NsfwHighPrecisionUserLabelRule",
+            "NsfwAvatarImageRule",
+            "NsfwBannerImageRule",
+            "NsfwNearPerfectAuthorRule",
             "SpamHighRecallUserLabelRule",
             "CompromisedUserLabelRule",
             "ReadOnlyUserLabelRule",
             "ImpersonationHighPrecisionUserLabelRule",
-            "NsfwAvatarImageRule",
-            "NsfwBannerImageRule",
             "AbusiveHighRecallRule",
-            "NsfwNearPerfectAuthorRule",
             "DoNotAmplifyNonFollowerRule",
         ]);
         assert_eq!(
-            policies.wired_rule_names(SafetyLevel::TimelineHomeRecommendations),
+            rule_engine.wired_rule_names(SafetyLevel::TimelineHomeRecommendations),
             recs
         );
     }
 
     #[test]
-    fn filter_all_policy_drops_pristine_candidate() {
-        let policies = Policies::new();
+    fn home_hydration_wires_only_its_ordered_baseline_rules() {
+        assert_eq!(
+            RuleEngine::for_tests().wired_rule_names(SafetyLevel::TimelineHomeHydration),
+            vec![
+                "PdnaTweetLabelRule",
+                "BounceTweetLabelRule",
+                "SpamTweetLabelRule",
+                "ForEmergencyUseOnlyDropRule",
+                "FosnrHatefulConductDropRule",
+                "FosnrViolentSpeechDropRule",
+                "FosnrAbuseDropRule",
+                "FosnrCivicIntegrityDropRule",
+                "DropExclusiveTweetContentRule",
+                "DropLegalTakendownPostRule",
+                "DropLocalLawsTakendownPostRule",
+                "SensitiveViewerLoggedOutDropRule",
+                "SensitiveViewerUnderageDropRule",
+                "SensitiveViewerNoStatedAgeDropRule",
+                "NsfwHighPrecisionAdultInterstitialRule",
+                "NsfwHighPrecisionInterstitialRule",
+                "GoreAndViolenceInterstitialRule",
+                "NsfwCardImageInterstitialRule",
+                "NsfwAdminInterstitialRule",
+                "NsfwUserInterstitialRule",
+                "BlockedViewerLimitedActionsRule",
+                "RootAuthorBlocksViewerLimitedActionsRule",
+                "LimitRepliesByInvitationConversationRule",
+                "LimitRepliesCommunityConversationRule",
+                "LimitRepliesSubscribersConversationRule",
+                "LimitRepliesVerifiedConversationRule",
+                "LimitRepliesMyNetworkConversationRule",
+                "LimitRepliesCoConversationRule",
+                "ReadOnlyViewerLimitedActionsRule",
+            ]
+        );
+    }
+
+    #[test]
+    fn immersive_expanded_recommendations_wires_only_its_ordered_rules() {
+        assert_eq!(
+            RuleEngine::for_tests().wired_rule_names(SafetyLevel::ImmersiveExpandedRecommendations),
+            vec![
+                "SuspendedAuthorRule",
+                "DeactivatedAuthorRule",
+                "ErasedAuthorRule",
+                "OffboardedAuthorRule",
+                "ProtectedAuthorDropRule",
+                "ViewerBlocksAuthorRule",
+                "ViewerMutesAuthorRule",
+                "MutedRetweetsRule",
+                "PdnaTweetLabelRule",
+                "BounceTweetLabelRule",
+                "SpamTweetLabelRule",
+                "ForEmergencyUseOnlyDropRule",
+                "FosnrHatefulConductDropRule",
+                "FosnrViolentSpeechDropRule",
+                "FosnrAbuseDropRule",
+                "FosnrCivicIntegrityDropRule",
+                "DropStaleTweetsRule",
+                "DropLegalTakendownPostRule",
+                "DropLocalLawsTakendownPostRule",
+                "SensitiveViewerLoggedOutDropRule",
+                "SensitiveViewerUnderageDropRule",
+                "SensitiveViewerNoStatedAgeDropRule",
+                "DropExclusiveTweetContentRule",
+                "DropTweetsWithDmcaMediaRule",
+                "DropTweetsWithGeoRestrictedMediaRule",
+                "GoreAndViolenceOonDropRule",
+                "DoNotAmplifyOonDropRule",
+                "MaliciousUrlOonDropRule",
+                "SpamHighRecallDropRule",
+                "SpamHighRecallUserLabelRule",
+                "CompromisedUserLabelRule",
+                "ReadOnlyUserLabelRule",
+                "ImpersonationHighPrecisionUserLabelRule",
+                "AbusiveHighRecallRule",
+                "DoNotAmplifyNonFollowerRule",
+                "NsfwSensitiveViewerDropTweetRule",
+                "NsfwSensitiveViewerDropUserRule",
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a rule reads Follows")]
+    fn a_rule_reading_an_underived_hydrator_panics_in_tests() {
+        let viewer = viewer(VIEWER_ID);
         let candidate = candidate().build();
-        let verdict = policies.evaluate(
-            SafetyLevel::FilterAll,
-            &ViewerFeatures::default(),
-            &candidate,
-        );
-        assert!(matches!(verdict.action, VfAction::Drop(_)));
-
-        let verdict = policies.evaluate(
-            SafetyLevel::TimelineHome,
-            &ViewerFeatures::default(),
-            &candidate,
-        );
-        assert!(matches!(verdict.action, VfAction::Allow));
+        let context = test_context(&viewer, &candidate)
+            .hydrated_by(Hydrators::all().without(Hydrator::Follows));
+        context.edge(Hydrator::Follows);
     }
 
     #[test]
-    fn dmca_media_drops_recommendations_only() {
-        let policies = Policies::new();
-        let candidate = candidate()
-            .with_tweet_features(TweetFeatures {
-                media: MediaFeature {
-                    has_dmca_media: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .build();
-
-        let timeline_home = policies.evaluate(
-            SafetyLevel::TimelineHome,
-            &ViewerFeatures::default(),
-            &candidate,
-        );
-        assert!(matches!(timeline_home.action, VfAction::Allow));
-
-        let recommendations = policies.evaluate(
-            SafetyLevel::TimelineHomeRecommendations,
-            &ViewerFeatures::default(),
-            &candidate,
-        );
-        assert!(matches!(recommendations.action, VfAction::Drop(_)));
-    }
-
-    #[test]
-    fn tweet_nsfw_flag_drops_recommendations_only() {
-        use crate::models::NsfwFeature;
-        let policies = Policies::new();
-        let candidate = candidate()
-            .with_tweet_features(TweetFeatures {
-                nsfw: NsfwFeature {
-                    user: true,
-                    admin: false,
-                },
-                ..Default::default()
-            })
-            .build();
+    fn every_leaf_reads_only_the_hydrators_it_declares() {
         let viewer = viewer(VIEWER_ID);
-
-        let timeline_home = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(timeline_home, VfAction::Allow),
-            "in-network tweet nsfw_user flag should allow, got {timeline_home:?}"
-        );
-
-        let recommendations = policies.evaluate(
-            SafetyLevel::TimelineHomeRecommendations,
-            &viewer,
-            &candidate,
-        );
-        assert!(matches!(recommendations.action, VfAction::Drop(_)));
-        assert_eq!(recommendations.decided_by, Some("TweetNsfwUserDropRule"));
-    }
-
-    #[test]
-    fn nsfw_author_interstitials_in_network_but_drops_oon() {
-        use crate::models::AuthorFeatures;
-        let policies = Policies::new();
-        let candidate = candidate()
-            .with_media()
-            .with_author_features(AuthorFeatures {
-                is_nsfw_user: true,
-                ..Default::default()
-            })
-            .build();
-        let viewer = viewer(VIEWER_ID);
-
-        let in_network = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(in_network, VfAction::Interstitial(_)),
-            "in-network NSFW author should interstitial, got {in_network:?}"
-        );
-
-        let oon = policies
-            .evaluate(
-                SafetyLevel::TimelineHomeRecommendations,
-                &viewer,
-                &candidate,
-            )
-            .action;
-        assert!(
-            matches!(oon, VfAction::Drop(_)),
-            "OON NSFW author should drop, got {oon:?}"
-        );
-    }
-
-    #[test]
-    fn egregious_nsfw_does_not_drop() {
-        use crate::models::SafetyLabelType;
-        use xai_x_thrift::user_labels::LabelValue;
-        let policies = Policies::new();
-
-        let tweet_candidate = candidate()
-            .with_label(SafetyLabelType::EGREGIOUS_NSFW)
-            .build();
-        let user_candidate = candidate_with_author_user_label(LabelValue::EGREGIOUS_NSFW, false);
-        let viewer = viewer(VIEWER_ID);
-
-        for candidate in [&tweet_candidate, &user_candidate] {
-            let in_network = policies
-                .evaluate(SafetyLevel::TimelineHome, &viewer, candidate)
-                .action;
-            assert!(
-                matches!(in_network, VfAction::Allow),
-                "in-network EgregiousNsfw should allow after rule removal, got {in_network:?}"
-            );
-            let oon = policies
-                .evaluate(SafetyLevel::TimelineHomeRecommendations, &viewer, candidate)
-                .action;
-            assert!(
-                matches!(oon, VfAction::Allow),
-                "OON EgregiousNsfw should allow after rule removal, got {oon:?}"
-            );
-        }
-    }
-
-    fn fosnr_candidate(
-        label: crate::models::SafetyLabelType,
-        follows: bool,
-    ) -> HydratedTweetCandidate {
-        let mut c = candidate().with_label(label).build();
-        c.relationship.viewer_follows_author = follows;
-        c
-    }
-
-    #[test]
-    fn fosnr_labels_drop_non_author_non_follower_on_both_surfaces() {
-        use crate::models::SafetyLabelType;
-        let policies = Policies::new();
-        let viewer = viewer(VIEWER_ID);
-        for label in [
-            SafetyLabelType::FOSNR_HATEFUL_CONDUCT,
-            SafetyLabelType::FOSNR_VIOLENT_SPEECH,
-            SafetyLabelType::FOSNR_ABUSE,
-            SafetyLabelType::FOSNR_CIVIC_INTEGRITY,
-        ] {
-            let candidate = fosnr_candidate(label, false);
-            for level in [
-                SafetyLevel::TimelineHome,
-                SafetyLevel::TimelineHomeRecommendations,
-            ] {
-                let action = policies.evaluate(level, &viewer, &candidate).action;
-                assert!(
-                    matches!(action, VfAction::Drop(_)),
-                    "{label:?} on {level:?} should drop non-follower, got {action:?}"
-                );
+        let candidate = candidate().build();
+        for &level in SafetyLevel::VARIANTS {
+            for condition in RuleEngine::select(level).rules().flat_map(|rule| rule.when) {
+                let leaves = match condition {
+                    Condition::Holds(leaf) | Condition::Not(leaf) => slice::from_ref(leaf),
+                    Condition::AnyOf(leaves) => leaves,
+                };
+                for &leaf in leaves {
+                    holds_narrowed(leaf, &viewer, &candidate);
+                }
             }
         }
     }
 
-    #[test]
-    fn fosnr_never_drops_author() {
-        use crate::models::SafetyLabelType;
-        let policies = Policies::new();
-        let author = author_viewer();
-        for label in [
-            SafetyLabelType::FOSNR_HATEFUL_CONDUCT,
-            SafetyLabelType::FOSNR_VIOLENT_SPEECH,
-            SafetyLabelType::FOSNR_ABUSE,
-            SafetyLabelType::FOSNR_CIVIC_INTEGRITY,
-            SafetyLabelType::FOSNR_ABUSE_INSULTS,
-        ] {
-            let candidate = fosnr_candidate(label, false);
-            for level in [
-                SafetyLevel::TimelineHome,
-                SafetyLevel::TimelineHomeRecommendations,
-            ] {
-                let action = policies.evaluate(level, &author, &candidate).action;
-                assert!(
-                    matches!(action, VfAction::Allow),
-                    "{label:?} on {level:?} should allow author, got {action:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn fosnr_abuse_insults_drops_oon_but_allows_in_network() {
-        use crate::models::SafetyLabelType;
-        let policies = Policies::new();
-        let viewer = viewer(VIEWER_ID);
-        let author = author_viewer();
-
-        for follows in [true, false] {
-            let candidate = fosnr_candidate(SafetyLabelType::FOSNR_ABUSE_INSULTS, follows);
-            let in_network = policies
-                .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-                .action;
-            assert!(
-                matches!(in_network, VfAction::Allow),
-                "in-network FosnrAbuseInsults should allow (follows={follows}), got {in_network:?}"
-            );
-        }
-
-        let candidate = fosnr_candidate(SafetyLabelType::FOSNR_ABUSE_INSULTS, false);
-        let oon = policies
-            .evaluate(
-                SafetyLevel::TimelineHomeRecommendations,
-                &viewer,
-                &candidate,
-            )
-            .action;
-        assert!(
-            matches!(oon, VfAction::Drop(_)),
-            "OON FosnrAbuseInsults should drop non-author, got {oon:?}"
-        );
-
-        let oon_author = policies
-            .evaluate(
-                SafetyLevel::TimelineHomeRecommendations,
-                &author,
-                &candidate,
-            )
-            .action;
-        assert!(
-            matches!(oon_author, VfAction::Allow),
-            "OON FosnrAbuseInsults should allow author, got {oon_author:?}"
-        );
-    }
-
-    #[test]
-    fn geo_restricted_media_drops_oon_but_allows_in_network() {
-        let policies = Policies::new();
-        let candidate = candidate()
-            .with_tweet_features(TweetFeatures {
-                media: MediaFeature {
-                    geo_deny_list: vec!["de".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .build();
-        let viewer = ViewerFeatures {
-            country_code: Some("de".to_string()),
-            ..viewer(VIEWER_ID)
+    mod engine {
+        use super::super::*;
+        use crate::hydration::Hydrator;
+        use crate::models::{
+            HydratedTweetCandidate, LimitedEngagementReason, TombstoneReason, ViewerFeatures,
         };
+        use crate::rules::fixtures::{allow, blurred};
+        use crate::rules::rule_spec::{
+            ActionSpec, Audience, Condition, Predicate, RelationshipPredicate, TweetPredicate,
+            ViewerPredicate,
+        };
+        use crate::rules::test_context;
+        use xai_visibility_filtering::models::FilteredReason;
+        use xai_x_thrift::action::InterstitialReason;
 
-        let in_network = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(in_network, VfAction::Allow),
-            "in-network geo-restricted media should allow (Scala wires the rule in THR only), got {in_network:?}"
-        );
+        const fn always(name: &'static str, action: ActionSpec) -> RuleClause {
+            RuleClause {
+                rule_name: name,
+                when: &[],
+                applies_to: Audience::Everyone,
+                action,
+            }
+        }
 
-        let oon = policies.evaluate(
-            SafetyLevel::TimelineHomeRecommendations,
-            &viewer,
-            &candidate,
-        );
-        assert!(
-            matches!(oon.action, VfAction::Drop(_)),
-            "OON geo-restricted media should drop, got {:?}",
-            oon.action
-        );
-        assert_eq!(oon.decided_by, Some("DropTweetsWithGeoRestrictedMediaRule"));
-    }
+        const NEVER_LEAF: Predicate = Predicate::Tweet(TweetPredicate::CreatedAfter(u64::MAX));
+        const NEVER: Condition = Condition::Holds(NEVER_LEAF);
 
-    #[test]
-    fn nsfw_text_drops_oon_but_allows_in_network() {
-        use crate::models::SafetyLabelType;
-        let policies = Policies::new();
-        let candidate = candidate().with_label(SafetyLabelType::NSFW_TEXT).build();
-        let viewer = viewer(VIEWER_ID);
+        const FOLLOWS: Predicate =
+            Predicate::Relationship(RelationshipPredicate::ViewerFollowsAuthor);
+        const BLOCKS: Predicate =
+            Predicate::Relationship(RelationshipPredicate::ViewerBlocksAuthor);
+        const LOGGED_OUT: Predicate = Predicate::Viewer(ViewerPredicate::LoggedOut);
 
-        let in_network = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(in_network, VfAction::Allow),
-            "in-network NsfwText should allow (Scala drops it OON only), got {in_network:?}"
-        );
+        const UNREACHABLE: Condition = Condition::Holds(FOLLOWS);
 
-        let oon = policies
-            .evaluate(
-                SafetyLevel::TimelineHomeRecommendations,
-                &viewer,
-                &candidate,
-            )
-            .action;
-        assert!(
-            matches!(oon, VfAction::Drop(_)),
-            "OON NsfwText should drop, got {oon:?}"
-        );
-    }
+        const DROP_SUSPENDED: ActionSpec = ActionSpec::Drop(FilteredReason::AuthorIsSuspended);
+        const TOMBSTONE: ActionSpec = ActionSpec::Tombstone(TombstoneReason::LocalRegulations);
+        const INTERSTITIAL_NSFW: ActionSpec = ActionSpec::Interstitial {
+            legacy: FilteredReason::ContainNsfwMedia,
+            media: InterstitialReason::Sensitive(true),
+        };
+        const INTERSTITIAL_UNSPECIFIED: ActionSpec = ActionSpec::Interstitial {
+            legacy: FilteredReason::UnspecifiedReason,
+            media: InterstitialReason::Nudity(true),
+        };
+        const LIMIT: ActionSpec =
+            ActionSpec::LimitedEngagement(LimitedEngagementReason::ConversationControl);
 
-    fn candidate_with_author_user_label(
-        label: xai_x_thrift::user_labels::LabelValue,
-        follows: bool,
-    ) -> HydratedTweetCandidate {
-        let mut c = candidate().with_author_user_label(label).build();
-        c.relationship.viewer_follows_author = follows;
-        c
-    }
+        fn context_inputs() -> (ViewerFeatures, HydratedTweetCandidate) {
+            (ViewerFeatures::default(), HydratedTweetCandidate::default())
+        }
 
-    #[test]
-    fn nsfw_avatar_user_label_drops_oon_but_allows_in_network() {
-        use xai_x_thrift::user_labels::LabelValue;
-        let policies = Policies::new();
-        let candidate = candidate_with_author_user_label(LabelValue::NSFW_AVATAR_IMAGE, false);
-        let viewer = viewer(VIEWER_ID);
+        fn withheld(value: Withholding, by: &'static str) -> Verdict {
+            Verdict::Withheld(Decided { value, by })
+        }
 
-        let in_network = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(in_network, VfAction::Allow),
-            "in-network NsfwAvatarImage should allow, got {in_network:?}"
-        );
+        static SHORT_CIRCUIT_ROWS: [RuleClause; 3] = [
+            RuleClause {
+                rule_name: "allow",
+                when: &[NEVER],
+                applies_to: Audience::Everyone,
+                action: DROP_SUSPENDED,
+            },
+            always("drop", DROP_SUSPENDED),
+            RuleClause {
+                rule_name: "after_drop",
+                when: &[UNREACHABLE],
+                applies_to: Audience::Everyone,
+                action: TOMBSTONE,
+            },
+        ];
+        static SHORT_CIRCUIT: Policy = Policy::new(&[&SHORT_CIRCUIT_ROWS]);
 
-        let oon = policies.evaluate(
-            SafetyLevel::TimelineHomeRecommendations,
-            &viewer,
-            &candidate,
-        );
-        assert!(
-            matches!(oon.action, VfAction::Drop(_)),
-            "OON NsfwAvatarImage should drop, got {:?}",
-            oon.action
-        );
-        assert_eq!(oon.decided_by, Some("NsfwAvatarImageRule"));
-    }
+        static TOMBSTONE_FIRST_ROWS: [RuleClause; 2] = [
+            always("tombstone", TOMBSTONE),
+            always("drop", DROP_SUSPENDED),
+        ];
+        static TOMBSTONE_FIRST: Policy = Policy::new(&[&TOMBSTONE_FIRST_ROWS]);
 
-    #[test]
-    fn recommendations_blacklist_does_not_drop() {
-        use xai_x_thrift::user_labels::LabelValue;
-        let policies = Policies::new();
-        let candidate =
-            candidate_with_author_user_label(LabelValue::RECOMMENDATIONS_BLACKLIST, false);
-        let viewer = viewer(VIEWER_ID);
+        static RESTRICTION_ROWS: [RuleClause; 4] = [
+            always("first_interstitial", INTERSTITIAL_NSFW),
+            always("first_limit", LIMIT),
+            always("second_interstitial", INTERSTITIAL_UNSPECIFIED),
+            always("second_limit", LIMIT),
+        ];
+        static RESTRICTIONS: Policy = Policy::new(&[&RESTRICTION_ROWS]);
 
-        let in_network = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(in_network, VfAction::Allow),
-            "in-network RecommendationsBlacklist should allow, got {in_network:?}"
-        );
+        #[test]
+        fn first_terminal_returns_before_later_rules() {
+            let (viewer, candidate) = context_inputs();
+            let context = test_context(&viewer, &candidate)
+                .hydrated_by(Hydrators::all().without(Hydrator::Follows));
 
-        let oon = policies
-            .evaluate(
-                SafetyLevel::TimelineHomeRecommendations,
-                &viewer,
-                &candidate,
-            )
-            .action;
-        assert!(
-            matches!(oon, VfAction::Allow),
-            "OON RecommendationsBlacklist should allow after rule removal, got {oon:?}"
-        );
-    }
-
-    #[test]
-    fn abusive_high_recall_allows_follower_on_both_surfaces() {
-        use xai_x_thrift::user_labels::LabelValue;
-        let policies = Policies::new();
-        let candidate = candidate_with_author_user_label(LabelValue::ABUSIVE_HIGH_RECALL, true);
-        let viewer = viewer(VIEWER_ID);
-
-        for level in [
-            SafetyLevel::TimelineHome,
-            SafetyLevel::TimelineHomeRecommendations,
-        ] {
-            let action = policies.evaluate(level, &viewer, &candidate).action;
-            assert!(
-                matches!(action, VfAction::Allow),
-                "AbusiveHighRecall follower on {level:?} should allow, got {action:?}"
+            assert_eq!(
+                SHORT_CIRCUIT.evaluate(&context).verdict,
+                withheld(Withholding::Drop(FilteredReason::AuthorIsSuspended), "drop")
+            );
+            assert_eq!(
+                TOMBSTONE_FIRST.evaluate(&context).verdict,
+                withheld(
+                    Withholding::Tombstone(TombstoneReason::LocalRegulations),
+                    "tombstone"
+                )
             );
         }
-    }
 
-    #[test]
-    fn abusive_high_recall_drops_oon_non_follower_but_allows_in_network() {
-        use xai_x_thrift::user_labels::LabelValue;
-        let policies = Policies::new();
-        let candidate = candidate_with_author_user_label(LabelValue::ABUSIVE_HIGH_RECALL, false);
-        let viewer = viewer(VIEWER_ID);
+        #[test]
+        fn each_slot_keeps_its_first_restriction() {
+            let (viewer, candidate) = context_inputs();
 
-        let in_network = policies
-            .evaluate(SafetyLevel::TimelineHome, &viewer, &candidate)
-            .action;
-        assert!(
-            matches!(in_network, VfAction::Allow),
-            "in-network AbusiveHighRecall should allow, got {in_network:?}"
-        );
+            let verdict = RESTRICTIONS
+                .evaluate(&test_context(&viewer, &candidate))
+                .verdict;
 
-        let oon = policies.evaluate(
-            SafetyLevel::TimelineHomeRecommendations,
-            &viewer,
-            &candidate,
-        );
-        assert!(
-            matches!(oon.action, VfAction::Drop(_)),
-            "OON AbusiveHighRecall non-follower should drop, got {:?}",
-            oon.action
-        );
-        assert_eq!(oon.decided_by, Some("AbusiveHighRecallRule"));
+            assert_eq!(
+                verdict,
+                Verdict::Shown {
+                    media: Some(Decided {
+                        value: MediaInterstitial {
+                            legacy: FilteredReason::ContainNsfwMedia,
+                            reason: InterstitialReason::Sensitive(true),
+                        },
+                        by: "first_interstitial",
+                    }),
+                    engagement: Some(Decided {
+                        value: LimitedEngagement(LimitedEngagementReason::ConversationControl),
+                        by: "first_limit",
+                    }),
+                }
+            );
+        }
+
+        fn follows_and_blocks_failed() -> (ViewerFeatures, HydratedTweetCandidate) {
+            let candidate = HydratedTweetCandidate {
+                failed: Hydrators::of(Hydrator::Follows).with(Hydrator::Blocks),
+                ..HydratedTweetCandidate::default()
+            };
+            (ViewerFeatures::default(), candidate)
+        }
+
+        #[test]
+        fn clauses_combine_in_three_values_and_unknown_resolves_to_the_default() {
+            let (viewer, candidate) = follows_and_blocks_failed();
+            let follows = Hydrators::of(Hydrator::Follows);
+            let dropped = withheld(Withholding::Drop(FilteredReason::AuthorIsSuspended), "rule");
+            let rows: [(&[Condition], Verdict, Hydrators); 6] = [
+                (&[Condition::Holds(FOLLOWS)], allow(), follows),
+                (
+                    &[Condition::Holds(FOLLOWS), NEVER],
+                    allow(),
+                    Hydrators::empty(),
+                ),
+                (&[Condition::Not(FOLLOWS)], dropped.clone(), follows),
+                (
+                    &[Condition::AnyOf(&[FOLLOWS, LOGGED_OUT])],
+                    dropped,
+                    Hydrators::empty(),
+                ),
+                (
+                    &[Condition::AnyOf(&[FOLLOWS, NEVER_LEAF])],
+                    allow(),
+                    follows,
+                ),
+                (
+                    &[
+                        Condition::AnyOf(&[BLOCKS, LOGGED_OUT]),
+                        Condition::Holds(FOLLOWS),
+                    ],
+                    allow(),
+                    follows,
+                ),
+            ];
+            for (index, (when, verdict, rested_on)) in rows.into_iter().enumerate() {
+                let rules = [RuleClause {
+                    rule_name: "rule",
+                    when,
+                    applies_to: Audience::Everyone,
+                    action: DROP_SUSPENDED,
+                }];
+                let evaluation =
+                    Policy::new(&[&rules]).evaluate(&test_context(&viewer, &candidate));
+                assert_eq!(
+                    (evaluation.verdict, evaluation.rested_on),
+                    (verdict, rested_on),
+                    "row {index}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_verdict_rests_on_the_unknown_clauses_that_could_have_changed_it() {
+            let (viewer, candidate) = follows_and_blocks_failed();
+            let follows = Hydrators::of(Hydrator::Follows);
+            let unknown = |action| RuleClause {
+                rule_name: "unknown",
+                when: &[Condition::Holds(FOLLOWS)],
+                applies_to: Audience::Everyone,
+                action,
+            };
+            let blur = blurred(InterstitialReason::Sensitive(true), "blur");
+            let rows = [
+                (
+                    [unknown(DROP_SUSPENDED), always("drop", DROP_SUSPENDED)],
+                    withheld(Withholding::Drop(FilteredReason::AuthorIsSuspended), "drop"),
+                    follows,
+                ),
+                (
+                    [unknown(INTERSTITIAL_NSFW), always("drop", DROP_SUSPENDED)],
+                    withheld(Withholding::Drop(FilteredReason::AuthorIsSuspended), "drop"),
+                    Hydrators::empty(),
+                ),
+                (
+                    [
+                        always("blur", INTERSTITIAL_NSFW),
+                        unknown(INTERSTITIAL_UNSPECIFIED),
+                    ],
+                    blur.clone(),
+                    Hydrators::empty(),
+                ),
+                (
+                    [always("blur", INTERSTITIAL_NSFW), unknown(LIMIT)],
+                    blur,
+                    follows,
+                ),
+            ];
+            for (index, (rules, verdict, rested_on)) in rows.into_iter().enumerate() {
+                let evaluation =
+                    Policy::new(&[&rules]).evaluate(&test_context(&viewer, &candidate));
+                assert_eq!(
+                    (evaluation.verdict, evaluation.rested_on),
+                    (verdict, rested_on),
+                    "row {index}"
+                );
+            }
+        }
     }
 }

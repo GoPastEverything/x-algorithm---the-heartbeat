@@ -270,8 +270,8 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "empty_history_user_dropout_rate": 0.1,
         "learning_rate": 2e-3,
         "emb_learning_rate": 0.1,
-        "qk_norm": False,
-        "attn_logit_cap": 80.0,
+        "qk_norm": True,
+        "attn_logit_cap": -1,
         "primer_norm": True,
         "feature_prep_enabled": True,
         "enable_candidate_tower_linear_proj": False,
@@ -293,6 +293,8 @@ def _xrecsys_two_tower_combined_base() -> dict:
         "head_names": ["home", "immersive"],
         "head_dataset_mapping": {
             "HOME": 0,
+            "HOME_COLD": 0,
+            "HOME_HOT": 0,
             "IMMERSIVE4Day": 1,
             "IMMERSIVE2Day": 1,
             "IMMERSIVENSFW": 1,
@@ -330,7 +332,7 @@ def _xrecsys_two_tower_combined_base() -> dict:
 _H100_OVERRIDES = {
     "bs_per_device": 480,
     "ep": 128,
-    "attn_impl": "pallas_ranker_varlen_attn",
+    "attn_impl": "cutedsl_ranker_varlen_attn",
 }
 
 _GB300_OVERRIDES = {"bs_per_device": 960, "ep": 64, "attn_impl": "cutedsl_ranker_varlen_attn"}
@@ -580,6 +582,7 @@ for config in configs:
         precision_level=2,
         reuse_run_id=False,
         evals=evals,
+        split_home_checkpoint=mparams.get("split_home_checkpoint", False),
         eval_every_n=mparams.get("eval_every_n", 1000),
         model_config=RecsysTwoTowerModelConfig(
             num_global_negatives_per_example=mparams["num_global_negatives_per_example"],
@@ -594,6 +597,11 @@ for config in configs:
             ),
             user_features=user_features_config,
             checkpoint_dataset_names=checkpoint_dataset_names,
+            split_home_checkpoint=mparams.get("split_home_checkpoint", False),
+            cold_start_max_age_seconds=mparams.get(
+                "cold_start_max_age_seconds",
+                RecsysTwoTowerModelConfig.cold_start_max_age_seconds,
+            ),
             immersive_positive_actions=mparams.get(
                 "immersive_positive_actions",
                 RecsysTwoTowerModelConfig.__dataclass_fields__[

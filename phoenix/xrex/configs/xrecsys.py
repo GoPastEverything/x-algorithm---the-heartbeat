@@ -86,6 +86,8 @@ def _make_feature_prep_config(mparams: dict, scale_config: ScaleConfig) -> Featu
         sid_codebook_size=mparams.get("sid_codebook_size", 1024),
         sid_hash_level=mparams.get("sid_hash_level", False),
         sid_cross_attn=mparams.get("sid_cross_attn", False),
+        sid_embedding_mode=mparams.get("sid_embedding_mode", "learned"),
+        sid_decoder_path=mparams.get("sid_decoder_path", ""),
         enable_stale_post=mparams.get("enable_stale_post", False),
     )
 
@@ -259,6 +261,7 @@ def _home_direct_packed_base() -> dict:
         "compute_post_unexplored_label": True,
         "use_seqpack": True,
         "right_anchored_rope": True,
+        "click_dwell_loss_weight": 1.0,
         "qk_norm": True,
         "attn_logit_cap": -1,
         "primer_norm": False,
@@ -289,6 +292,7 @@ def _home_direct_packed_base() -> dict:
             enable_is_author_followed_by_viewer=True,
             enable_is_author_following_viewer=True,
             enable_engagement_counts=True,
+            enable_click_dwell_time=True,
             hour_of_day_dither_fraction=0.1,
         ),
         "seqpack_distribution": BetaLengthDistribution(
@@ -305,7 +309,7 @@ def _home_direct_packed_base() -> dict:
 _H100_OVERRIDES = {
     "bs_per_device": 256,
     "ep": 256,
-    "attn_impl": "pallas_ranker_varlen_attn",
+    "attn_impl": "cutedsl_ranker_varlen_attn",
     "learning_rate": 7.1e-4,
     "checkpoint_every_n": 150,
     "optim_config": RecsysDenseOptimConfig(
@@ -384,7 +388,6 @@ MODEL_CFGS = {
             "use_seqpack": True,
             "right_anchored_rope": True,
             "compute_post_unexplored_label": True,
-            "multimodal_embedding_type": "v5",
             "seqpack_distribution": BetaLengthDistribution(
                 min_len=126,
                 max_len=1022,
@@ -642,10 +645,11 @@ for config in configs:
             mask_candidate_positive_when_negative_action_present=mparams.get(
                 "mask_candidate_positive_when_negative_action_present", False
             ),
-            train_view_through_heads=mparams.get("train_view_through_heads", False),
+            ads_head_masking=mparams.get("ads_head_masking", False),
             concat_history_bridge_prob=mparams.get("concat_history_bridge_prob", False),
             mact_in_app_loss_weight=mparams.get("mact_in_app_loss_weight", 1.0),
-            split_head_training_by_source=mparams.get("split_head_training_by_source", False),
+            purchase_value_loss_weight=mparams.get("purchase_value_loss_weight", 0.0),
+            purchase_value_huber_delta=mparams.get("purchase_value_huber_delta", 1.0),
             condition_search_relevance_on_prompt=mparams.get(
                 "condition_search_relevance_on_prompt", False
             ),
@@ -678,6 +682,14 @@ for config in configs:
                         recsys_pb2.ProductSurface.PRODUCT_SURFACE_GALLERY_PAGE,
                     ),
                     norm_config=NormConfig(norm_scale=30.0, use_log=False),
+                ),
+                ContinuousActionLossConfig(
+                    action_index=recsys_pb2.ContinuousActionName.CLICK_DWELL_TIME,
+                    metric_name="click-dwell-binary",
+                    loss_weight=mparams.get("click_dwell_loss_weight", 0.0),
+                    loss_type="binary",
+                    binary_threshold=10.0,
+                    norm_config=NormConfig(norm_scale=60.0),
                 ),
             ],
             context_features=ContextFeaturesConfig(
