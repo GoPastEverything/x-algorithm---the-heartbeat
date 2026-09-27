@@ -1,5 +1,7 @@
 use crate::models::candidate::PostCandidate;
+use crate::models::pulse::causal_multiplier;
 use crate::models::query::ScoredPostsQuery;
+use crate::params::EnablePulsePrior;
 use crate::scorers::value_model;
 use tonic::async_trait;
 use xai_candidate_pipeline::scorer::Scorer;
@@ -22,9 +24,10 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for PhoenixScoresRankingScorer {
             .iter()
             .map(|c| {
                 let weighted = value_model::weighted_score(query, &weights, c);
+                let q = causal_multiplier(query.params.get(EnablePulsePrior), c.pulse.as_ref());
                 Ok(PostCandidate {
                     weighted_score: Some(weighted),
-                    score: Some(weighted),
+                    score: Some(weighted * q),
                     ..Default::default()
                 })
             })

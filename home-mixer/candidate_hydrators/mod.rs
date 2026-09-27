@@ -21,3 +21,4 @@ pub mod topic_feedback_context_hydrator;
 pub mod tweet_type_metrics_hydrator;
 pub mod vf_candidate_hydrator;
 pub mod vf_following_candidate_hydrator;
+pub mod pulse_hydrator;
