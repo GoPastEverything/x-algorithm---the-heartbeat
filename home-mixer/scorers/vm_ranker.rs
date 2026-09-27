@@ -1,5 +1,6 @@
 use crate::clients::vm_ranker_client::{VMRankerClient, VMRankerCluster};
 use crate::models::candidate::{PostCandidate, SlateContext};
+use crate::models::pulse::causal_multiplier;
 use crate::models::query::ScoredPostsQuery;
 use crate::params::*;
 use crate::scorers::author_cold_start::{AuthorColdStart, ColdStartOutcome};
@@ -110,6 +111,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
             Err(msg) => {
                 tracing::warn!(error = %msg, "VMRanker rank failed; serving local weighted scores");
                 record_fallback("rpc_error", candidates.len());
+                apply_pulse(query, candidates, &mut scored);
                 return scored.into_iter().map(Ok).collect();
             }
         };
@@ -133,6 +135,7 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         if missing > 0 {
             record_fallback("missing_candidate", missing);
         }
+        apply_pulse(query, candidates, &mut scored);
         scored.into_iter().map(Ok).collect()
     }
 
@@ -142,6 +145,19 @@ impl Scorer<ScoredPostsQuery, PostCandidate> for VMRanker {
         candidate.author_policy_zeroed = scored.author_policy_zeroed;
         candidate.cold_start_lift_to_rank = scored.cold_start_lift_to_rank;
         candidate.slate_context = scored.slate_context;
+    }
+}
+
+fn apply_pulse(
+    query: &ScoredPostsQuery,
+    candidates: &[PostCandidate],
+    scored: &mut [PostCandidate],
+) {
+    let enabled = query.params.get(EnablePulsePrior);
+    for (src, out) in candidates.iter().zip(scored.iter_mut()) {
+        if let Some(score) = out.score {
+            out.score = Some(score * causal_multiplier(enabled, src.pulse.as_ref()));
+        }
     }
 }
 
