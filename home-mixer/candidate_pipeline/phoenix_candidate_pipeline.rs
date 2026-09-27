@@ -4,6 +4,7 @@ use crate::candidate_hydrators::bidirectional_follow_hydrator::BidirectionalFoll
 use crate::candidate_hydrators::blocked_by_hydrator::BlockedByHydrator;
 use crate::candidate_hydrators::core_data_candidate_hydrator::CoreDataCandidateHydrator;
 use crate::candidate_hydrators::engagement_counts_hydrator::EngagementCountsHydrator;
+use crate::candidate_hydrators::pulse_hydrator::PulseHydrator;
 use crate::candidate_hydrators::filtered_topics_hydrator::FilteredTopicsHydrator;
 use crate::candidate_hydrators::following_replied_users_hydrator::FollowingRepliedUsersHydrator;
 use crate::candidate_hydrators::gizmoduck_hydrator::GizmoduckCandidateHydrator;
@@ -340,6 +341,8 @@ impl PhoenixCandidatePipeline {
             }),
             Box::new(LanguageCodeHydrator::new(tes_client.clone()).await),
             Box::new(EngagementCountsHydrator::new(engagement_counts_client).await),
+            // Empty source. Flag default off. Does not read engagement counts.
+            Box::new(PulseHydrator::empty()),
             Box::new(SemanticIdHydrator::new(sid_client)),
         ];
 
