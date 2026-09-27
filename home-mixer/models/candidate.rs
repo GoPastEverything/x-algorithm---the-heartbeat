@@ -21,6 +21,10 @@ pub struct PostCandidate {
     pub last_scored_at_ms: Option<u64>,
     pub weighted_score: Option<f64>,
     pub score: Option<f64>,
+    /// Causal liveness prior. Absent or wide means ranking is unchanged.
+    /// Never a user-visible score. See docs/pulse.md.
+    #[serde(default)]
+    pub pulse: Option<super::pulse::PulseEvidence>,
     pub slate_context: Option<SlateContext>,
     #[serde(default)]
     pub served_slate_context: Option<SlateContext>,

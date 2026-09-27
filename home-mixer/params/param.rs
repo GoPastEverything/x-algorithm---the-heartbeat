@@ -243,6 +243,24 @@ param!(
     "rust_home_mixer_author_diversity_floor",
     0.25
 );
+
+// PULSE: causal liveness prior. Default off. A missing or wide posterior
+// must not change the score. See docs/pulse.md.
+param!(
+    EnablePulsePrior,
+    bool,
+    "rust_home_mixer_enable_pulse_prior",
+    false
+);
+// Fills PostCandidate.pulse from a lagged event source. Default off.
+// The registered source is empty, so turning this on does not change scores.
+// See docs/pulse.md.
+param!(
+    EnablePulseHydrator,
+    bool,
+    "rust_home_mixer_enable_pulse_hydrator",
+    false
+);
 param!(
     LogSlateContext,
     bool,
