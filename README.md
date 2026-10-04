@@ -7,7 +7,7 @@ It is a public fork of that snapshot, plus a causal **PULSE** (Human Liveness Si
 | | |
 |---|---|
 | Upstream | [xai-org/x-algorithm](https://github.com/xai-org/x-algorithm) `@4c5cfe8` (2026-09-26) |
-| This repo | [GoPastEverything/x-algorithm---the-heartbeat](https://github.com/GoPastEverything/x-algorithm--the-heartbeat) |
+| This repo | [GoPastEverything/x-algorithm---the-heartbeat](https://github.com/GoPastEverything/x-algorithm---the-heartbeat) |
 | Live lab (docs + sim) | [xalgorithm.grok.me](https://xalgorithm.grok.me) |
 | Current PULSE branch | `pulse/causal-q-4c5cfe8` |
 | Current PULSE PR | [#3](https://github.com/GoPastEverything/x-algorithm---the-heartbeat/pull/3) (draft) |
